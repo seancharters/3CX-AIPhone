@@ -1,0 +1,6 @@
+__pycache__/
+tickets/
+voice-samples/
+.DS_Store
+.env
+*.wav

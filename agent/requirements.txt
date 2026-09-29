@@ -1,0 +1,5 @@
+pipecat-ai[anthropic,azure,deepgram,elevenlabs,openai,silero,websocket]==1.12.0
+fastapi
+uvicorn[standard]
+itsdangerous
+python-multipart

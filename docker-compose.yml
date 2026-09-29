@@ -1,0 +1,44 @@
+services:
+  asterisk:
+    build: ./asterisk
+    restart: unless-stopped
+    stop_grace_period: 20s  # time to unregister from 3CX before stopping
+    ports:
+      - "5060:5060/udp"                # SIP to/from 3CX
+      - "10000-10099:10000-10099/udp"  # call audio (RTP); matches rtp.conf
+    volumes:
+      - data:/data:ro                  # settings saved by the admin UI
+    depends_on:
+      agent:
+        condition: service_healthy
+
+  agent:
+    build: ./agent
+    image: ai-phone-agent  # shared with admin, so one build updates both
+    restart: unless-stopped
+    volumes:
+      - data:/data
+      - tickets:/srv/tickets
+    # No published ports: only Asterisk talks to the agent, over the internal network.
+
+  admin:
+    image: ai-phone-agent
+    command: ["uvicorn", "app.admin:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+    restart: unless-stopped
+    volumes:
+      - data:/data
+    ports:
+      # Only reachable from the server itself. From your laptop:
+      #   ssh -L 8000:localhost:8000 you@server   then open http://localhost:8000
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/login')"]
+      interval: 30s
+      timeout: 3s
+    depends_on:
+      agent:
+        condition: service_healthy
+
+volumes:
+  data:
+  tickets:
