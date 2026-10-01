@@ -13,7 +13,7 @@ import json
 import os
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -95,6 +95,8 @@ class Field:
     labels: tuple[str, ...] = ()  # display names for choices, same order
     multiline: bool = False  # shown as a text box; line breaks are turned into spaces
     long_text: bool = False  # large text box; line breaks kept. Stored empty while it equals the default
+    # Only shown in the admin UI when any of these settings has one of the listed values.
+    show_if: tuple[tuple[str, tuple[str, ...]], ...] = ()
     validate: Callable[[str], str] = _single_line
     asterisk: bool = False  # also exported to Asterisk
 
@@ -145,24 +147,24 @@ FIELDS: tuple[Field, ...] = (
           default="en-AU-William:DragonHDOmniLatestNeural",
           choices=('en-AU-William:DragonHDOmniLatestNeural', 'en-AU-Natasha:DragonHDOmniLatestNeural', 'en-au-siennatopaz:DragonHDOmniLatestNeural', 'en-au-cyanspark:DragonHDOmniLatestNeural', 'en-AU-Isla:MAI-Voice-2-Flash', 'en-AU-NatashaNeural', 'en-AU-WilliamNeural', 'en-AU-WilliamMultilingualNeural', 'en-AU-AnnetteNeural', 'en-AU-CarlyNeural', 'en-AU-DarrenNeural', 'en-AU-DuncanNeural', 'en-AU-ElsieNeural', 'en-AU-FreyaNeural', 'en-AU-JoanneNeural', 'en-AU-KenNeural', 'en-AU-KimNeural', 'en-AU-NeilNeural', 'en-AU-TimNeural', 'en-AU-TinaNeural'),
           labels=('William HD (male) · natural, recommended', 'Natasha HD (female) · natural', 'Sienna HD (female) · natural', 'Cyan HD (female) · natural', 'Isla MAI (female) · most expressive, preview, slower to start', 'Natasha (female) · standard, fastest', 'William (male) · standard', 'William Multilingual (male) · standard', 'Annette (female) · standard', 'Carly (female) · standard', 'Darren (male) · standard', 'Duncan (male) · standard', 'Elsie (female) · standard', 'Freya (female) · standard', 'Joanne (female) · standard', 'Ken (male) · standard', 'Kim (female) · standard', 'Neil (male) · standard', 'Tim (male) · standard', 'Tina (female) · standard')),
-    # Anthropic / Deepgram
-    Field("ANTHROPIC_API_KEY", "Anthropic API key", "Anthropic and Deepgram",
+    # Anthropic, Deepgram
+    Field("ANTHROPIC_API_KEY", "Anthropic API key", "Anthropic",
           "Only needed if selected above. console.anthropic.com → API Keys", secret=True),
-    Field("CLAUDE_MODEL", "Claude model", "Anthropic and Deepgram", "Sonnet/Haiku respond faster; Opus is smartest",
+    Field("CLAUDE_MODEL", "Claude model", "Anthropic", "Sonnet/Haiku respond faster; Opus is smartest",
           default="claude-opus-5", choices=("claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5")),
-    Field("CLAUDE_EFFORT", "Claude effort", "Anthropic and Deepgram", "Low keeps replies fast. Ignored for Haiku",
+    Field("CLAUDE_EFFORT", "Claude effort", "Anthropic", "Low keeps replies fast. Ignored for Haiku",
           default="low", choices=("low", "medium", "high")),
-    Field("DEEPGRAM_API_KEY", "Deepgram API key", "Anthropic and Deepgram",
+    Field("DEEPGRAM_API_KEY", "Deepgram API key", "Deepgram",
           "Only needed if selected above. console.deepgram.com", secret=True),
     # Voice
-    Field("ELEVEN_API_KEY", "ElevenLabs API key", "Voice (ElevenLabs)",
+    Field("ELEVEN_API_KEY", "ElevenLabs API key", "ElevenLabs",
           "Needed if Voice or Speech-to-text is ElevenLabs (both use the same credits). The key needs "
           "text-to-speech and/or speech-to-text permission. elevenlabs.io → API Keys", secret=True),
-    Field("ELEVENLABS_VOICE_ID", "ElevenLabs voice ID", "Voice (ElevenLabs)",
+    Field("ELEVENLABS_VOICE_ID", "ElevenLabs voice ID", "ElevenLabs",
           "Empty = Charlie (Australian). To use a Voice Library voice, first click \"Add to My Voices\" "
           "in ElevenLabs (and be on a paid plan), otherwise calls are silent",
           validate=_pattern(r"[A-Za-z0-9]+", "Letters and numbers only")),
-    Field("ELEVENLABS_MODEL", "ElevenLabs model", "Voice (ElevenLabs)",
+    Field("ELEVENLABS_MODEL", "ElevenLabs model", "ElevenLabs",
           "v4 Turbo is ElevenLabs' newest real-time model and the most natural; Flash v2.5 is marginally faster",
           default="eleven_flash_v2_5",
           choices=("eleven_v4_turbo", "eleven_flash_v2_5", "eleven_v4", "eleven_v3_conversational",
@@ -238,7 +240,43 @@ FIELDS: tuple[Field, ...] = (
           secret=True, asterisk=True),
 )
 
+STT = "STT_PROVIDER"
+TTS = "TTS_PROVIDER"
+LLM = "LLM_PROVIDER"
+EMAIL = "TICKET_EMAIL_ENABLED"
+
+# Which provider choices each setting belongs to, so the admin UI shows only what's in use.
+SHOW_IF: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    # The Azure OpenAI endpoint/key are also whisper's fallback.
+    "AZURE_OPENAI_ENDPOINT": ((LLM, ("azure_openai",)), (STT, ("azure_whisper",))),
+    "AZURE_OPENAI_API_KEY": ((LLM, ("azure_openai",)), (STT, ("azure_whisper",))),
+    "AZURE_OPENAI_DEPLOYMENT": ((LLM, ("azure_openai",)),),
+    "AZURE_OPENAI_REASONING": ((LLM, ("azure_openai",)),),
+    "AZURE_WHISPER_ENDPOINT": ((STT, ("azure_whisper",)),),
+    "AZURE_WHISPER_API_KEY": ((STT, ("azure_whisper",)),),
+    "AZURE_WHISPER_DEPLOYMENT": ((STT, ("azure_whisper",)),),
+    "AZURE_WHISPER_DELAY": ((STT, ("azure_whisper",)),),
+    "AZURE_SPEECH_REGION": ((STT, ("azure",)), (TTS, ("azure",))),
+    "AZURE_SPEECH_KEY": ((STT, ("azure",)), (TTS, ("azure",))),
+    "AZURE_TTS_VOICE": ((TTS, ("azure",)),),
+    "ANTHROPIC_API_KEY": ((LLM, ("anthropic",)),),
+    "CLAUDE_MODEL": ((LLM, ("anthropic",)),),
+    "CLAUDE_EFFORT": ((LLM, ("anthropic",)),),
+    "DEEPGRAM_API_KEY": ((STT, ("deepgram",)),),
+    "ELEVEN_API_KEY": ((TTS, ("elevenlabs",)), (STT, ("elevenlabs",))),
+    "ELEVENLABS_VOICE_ID": ((TTS, ("elevenlabs",)),),
+    "ELEVENLABS_MODEL": ((TTS, ("elevenlabs",)),),
+    "STT_VOCABULARY": ((STT, ("azure", "elevenlabs")),),
+    **{k: ((EMAIL, ("yes",)),) for k in (
+        "EMAIL_TO", "EMAIL_FROM", "SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_USERNAME", "SMTP_PASSWORD")},
+}
+FIELDS = tuple(replace(f, show_if=SHOW_IF.get(f.key, ())) for f in FIELDS)
 FIELDS_BY_KEY = {f.key: f for f in FIELDS}
+assert set(SHOW_IF) <= set(FIELDS_BY_KEY)
+
+
+def visible(field: Field, values: dict[str, str]) -> bool:
+    return not field.show_if or any(values.get(key) in allowed for key, allowed in field.show_if)
 
 
 def load() -> dict[str, str]:
@@ -247,6 +285,12 @@ def load() -> dict[str, str]:
     if SETTINGS_FILE.exists():
         stored = json.loads(SETTINGS_FILE.read_text())
     return {f.key: str(stored.get(f.key) or f.default) for f in FIELDS}
+
+
+def stored() -> dict[str, str]:
+    """All settings as saved, with "" for anything left at its default (so it keeps tracking it)."""
+    raw: dict[str, Any] = json.loads(SETTINGS_FILE.read_text()) if SETTINGS_FILE.exists() else {}
+    return {f.key: str(raw.get(f.key) or "") for f in FIELDS}
 
 
 def save(updates: dict[str, str]) -> dict[str, str]:

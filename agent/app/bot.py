@@ -69,6 +69,14 @@ TOOL_RULES = """
 - Only read out a ticket reference that create_ticket returned to you. Never make one up. If you \
 haven't called create_ticket successfully, don't give the caller a reference."""
 
+# Appended when transfers are configured. Urgent calls should reach a person, not wait for a callback.
+P1_RULES = """
+- P1 issues (the whole site or business can't work, a core system is down for everyone, or a \
+security incident) go straight to an engineer. As soon as it's clear the issue is P1, collect only \
+the caller's name, organisation, callback number and what's down, then call create_ticket, read \
+the reference, and call transfer_to_human straight away. Don't keep triaging, don't promise a \
+callback, and don't ask if there's anything else first."""
+
 
 class JSONSpeechFilter(BaseTextFilter):
     """Stops the voice reading out JSON, e.g. a tool call the model wrote as text.
@@ -135,6 +143,7 @@ class CallInfo:
     codec: str = ""  # phone-line audio codec, e.g. g722
     ticket_started: bool = False  # create_ticket has been called
     ticket_id: str | None = None
+    ticket_priority: str = ""
     transfer_started: bool = False  # transfer_to_human has been called
 
 
@@ -429,8 +438,16 @@ def _tools(
             transcript=list(params.context.get_messages()),
         )
         call.ticket_id = await tickets.create(ticket)
+        call.ticket_priority = ticket.priority
         logger.info(f"Created ticket {call.ticket_id} ({ticket.priority}) for {ticket.organisation}")
         note(f"🎫 Ticket {call.ticket_id} created: {ticket.priority}, {ticket.summary}")
+        if ticket.priority == "P1" and transfer_target:
+            await params.result_callback(
+                f"Ticket created: {call.ticket_id}. This is P1, so read the reference to the caller "
+                "slowly, character by character, then call transfer_to_human straight away. Don't "
+                "promise a callback or ask if there's anything else."
+            )
+            return
         await params.result_callback(
             f"Ticket created: {call.ticket_id}. Read the reference to the caller slowly, "
             "character by character."
@@ -600,7 +617,8 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
         if call.caller_number
         else ""
     )
-    llm = _llm(cfg, instructions(cfg["COMPANY_NAME"], cfg["SYSTEM_PROMPT"]) + TOOL_RULES + caller_ctx)
+    llm = _llm(cfg, instructions(cfg["COMPANY_NAME"], cfg["SYSTEM_PROMPT"]) + TOOL_RULES
+               + (P1_RULES if cfg["TRANSFER_TARGET"] else "") + caller_ctx)
     stt = _stt(cfg)
     http = aiohttp.ClientSession()
     tts = _tts(cfg, call_id, http)
@@ -664,6 +682,8 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
             asyncio.create_task(nudge("ticket"))
         elif not call.transfer_started and claims_transfer(text):
             asyncio.create_task(nudge("transfer"))
+        elif call.ticket_priority == "P1" and cfg["TRANSFER_TARGET"] and not call.transfer_started:
+            asyncio.create_task(nudge("p1"))
 
     async def nudge(kind: str):
         nonlocal nudges
@@ -678,14 +698,24 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
                 "create_ticket. Call create_ticket now with the details you have collected, then read the "
                 "caller the reference it returns."
             )
+        elif kind == "p1":
+            what, instruction = "", (
+                "This is a P1 ticket, so the caller must be transferred to an engineer now. Call "
+                "transfer_to_human now. Don't say anything else first."
+            )
         else:
             what, instruction = "transferring the caller", (
                 "You told the caller you are transferring them, but you have not called transfer_to_human. "
                 "Call transfer_to_human now. Don't say anything else first."
             )
-        logger.warning(f"Agent said it was {what} without calling the tool; prompting it")
-        bus.publish({"type": "note", "call_id": call_id,
-                     "text": f"⚠️ Agent said it was {what} without doing it; told it to do it now"})
+        if kind == "p1":
+            logger.warning("Agent carried on after a P1 ticket without transferring; prompting it")
+            bus.publish({"type": "note", "call_id": call_id,
+                         "text": "⚠️ P1 ticket but the agent didn't transfer; told it to transfer now"})
+        else:
+            logger.warning(f"Agent said it was {what} without calling the tool; prompting it")
+            bus.publish({"type": "note", "call_id": call_id,
+                         "text": f"⚠️ Agent said it was {what} without doing it; told it to do it now"})
         context.add_message({"role": "user", "content": f"[System note, not from the caller: {instruction}]"})
         await worker.queue_frames([LLMRunFrame()])
 

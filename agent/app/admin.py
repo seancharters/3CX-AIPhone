@@ -13,11 +13,12 @@ import html
 import json
 import re
 import secrets
+from datetime import datetime
 from itertools import groupby
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, UploadFile
 import httpx
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from loguru import logger
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -28,6 +29,7 @@ from .triage import tickets
 ADMIN_FILE = settings.DATA_DIR / "admin.json"
 SESSION_SECRET_FILE = settings.DATA_DIR / "session_secret"
 MIN_PASSWORD = 10
+BACKUP_FORMAT = "it-triage-agent-settings"
 
 
 def _session_secret() -> str:
@@ -131,6 +133,54 @@ async def test_email(request: Request):
     except Exception as e:
         logger.warning(f"Test email failed: {e!r}")
         request.session["flash"] = ("error", f"Saved, but the test email failed: {type(e).__name__}: {e}")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/backup")
+async def backup(request: Request):
+    """All settings, API keys included, as a JSON file to download."""
+    if not request.session.get("admin"):
+        return RedirectResponse("/login", status_code=303)
+    data = {"format": BACKUP_FORMAT, "version": 1, "created": datetime.now().isoformat(timespec="seconds"),
+            "settings": settings.stored()}
+    name = f"it-triage-agent-backup-{datetime.now():%Y%m%d-%H%M}.json"
+    logger.info("Settings backup downloaded from admin UI")
+    return Response(
+        json.dumps(data, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"},
+    )
+
+
+@app.post("/restore")
+async def restore(request: Request, file: UploadFile):
+    """Replace all settings with those in a backup file."""
+    if not request.session.get("admin"):
+        return RedirectResponse("/login", status_code=303)
+    try:
+        data = json.loads(await file.read(1_000_000))
+        if not isinstance(data, dict) or data.get("format") != BACKUP_FORMAT:
+            raise ValueError
+        backed_up = data["settings"]
+        if not isinstance(backed_up, dict):
+            raise ValueError
+    except (ValueError, KeyError, UnicodeDecodeError):
+        request.session["flash"] = ("error", "That isn't a backup from this admin page. Nothing was changed.")
+        return RedirectResponse("/", status_code=303)
+    try:
+        # Anything missing from the backup goes back to its default.
+        settings.save({f.key: str(backed_up.get(f.key) or "") for f in settings.FIELDS})
+    except settings.ValidationError as err:
+        request.session["flash"] = ("error", f"Couldn't restore, nothing was changed. {err}")
+        return RedirectResponse("/", status_code=303)
+    ignored = sorted(set(backed_up) - set(settings.FIELDS_BY_KEY))
+    logger.info(f"Settings restored from backup made {data.get('created', 'at an unknown time')}")
+    request.session["flash"] = (
+        "ok",
+        f"Restored the backup from {data.get('created', 'an unknown date')}. New settings apply to the next "
+        "call, and Asterisk re-registers with 3CX within a few seconds."
+        + (f" Ignored settings this version doesn't have: {', '.join(ignored)}." if ignored else ""),
+    )
     return RedirectResponse("/", status_code=303)
 
 
@@ -240,22 +290,28 @@ def _settings_form(values: dict[str, str], flash: tuple[str, str] | None) -> str
         '<span id="detail" class="muted"></span></p></section>'
     )
     parts.append('<form method="post" autocomplete="off">')
-    for section, fields in groupby(settings.FIELDS, key=lambda f: f.section):
-        parts.append(f'<section class="card"><h2>{e(section)}</h2>')
+    for section, group in groupby(settings.FIELDS, key=lambda f: f.section):
+        fields = list(group)
+        hidden = "" if any(settings.visible(f, values) for f in fields) else " hidden"
+        parts.append(f'<section class="card{hidden}"><h2>{e(section)}</h2>')
         for f in fields:
-            parts.append(_field(f, values[f.key]))
+            parts.append(_field(f, values[f.key], settings.visible(f, values)))
         if section == "Email tickets":
             parts.append(
-                '<div class="actions"><button type="submit" formaction="/test-email" class="secondary">'
+                '<div class="actions" data-show-if=\'{"TICKET_EMAIL_ENABLED": ["yes"]}\''
+                + ("" if values.get("TICKET_EMAIL_ENABLED") == "yes" else ' hidden')
+                + '><button type="submit" formaction="/test-email" class="secondary">'
                 "Save and send test email</button></div>"
             )
         parts.append("</section>")
     parts.append('<div class="actions"><button type="submit">Save settings</button></div></form>')
+    parts.append(_BACKUP_CARD)
     parts.append(_STATUS_SCRIPT)
+    parts.append(_VISIBILITY_SCRIPT)
     return "".join(parts)
 
 
-def _field(f: settings.Field, value: str) -> str:
+def _field(f: settings.Field, value: str, visible: bool = True) -> str:
     label = f'<label for="{f.key}">{e(f.label)}</label>'
     help_ = f'<small>{e(f.help)}</small>' if f.help else ""
     if f.choices:
@@ -283,7 +339,10 @@ def _field(f: settings.Field, value: str) -> str:
         )
     else:
         control = f'<input id="{f.key}" name="{f.key}" value="{e(value)}">'
-    return f'<div class="field">{label}{control}{help_}</div>'
+    show_if = (
+        f" data-show-if='{e(json.dumps({k: list(v) for k, v in f.show_if}))}'" if f.show_if else ""
+    )
+    return f'<div class="field"{show_if}{"" if visible else " hidden"}>{label}{control}{help_}</div>'
 
 
 def _setup_form(error: str = "") -> str:
@@ -385,6 +444,34 @@ function connect() {
 connect();
 </script>"""
 
+_BACKUP_CARD = """<section class="card"><h2>Backup and restore</h2>
+<p>Download every setting, including API keys, passwords and the system prompt, as a file. Restore it
+here, or on a new server, to put everything back. The admin password and tickets aren't included.</p>
+<p class="flash error">The backup contains your API keys and 3CX password in plain text. Store it
+somewhere safe, such as a password manager, and don't email it.</p>
+<div class="actions split"><a class="button secondary" href="/backup">Download backup</a>
+<form method="post" action="/restore" enctype="multipart/form-data" class="restore"
+ onsubmit="return confirm('Replace all current settings with this backup?')">
+<input type="file" name="file" accept=".json,application/json" required>
+<button type="submit" class="secondary">Restore</button></form></div></section>"""
+
+_VISIBILITY_SCRIPT = """<script>
+// Show only the settings that apply to the providers selected. Hidden fields keep their values.
+function applyVisibility() {
+  const val = k => (document.querySelector('[name="' + k + '"]') || {}).value;
+  document.querySelectorAll('[data-show-if]').forEach(el => {
+    const rules = JSON.parse(el.dataset.showIf);
+    el.hidden = !Object.entries(rules).some(([k, allowed]) => allowed.includes(val(k)));
+  });
+  document.querySelectorAll('form section.card').forEach(sec => {
+    const fields = sec.querySelectorAll('.field');
+    sec.hidden = fields.length > 0 && [...fields].every(f => f.hidden);
+  });
+}
+document.querySelectorAll('select').forEach(s => s.addEventListener('change', applyVisibility));
+applyVisibility();
+</script>"""
+
 _STATUS_SCRIPT = """<script>
 async function refresh() {
   try {
@@ -422,7 +509,11 @@ small { display:block; color:var(--muted); margin-top:4px; }
 .actions { display:flex; justify-content:flex-end; }
 button { background:var(--accent); color:#fff; border:0; border-radius:7px; padding:10px 18px; font:inherit;
          font-weight:600; cursor:pointer; }
-button.secondary { background:none; color:var(--accent); border:1px solid var(--accent); }
+button.secondary, a.button.secondary { background:none; color:var(--accent); border:1px solid var(--accent); }
+a.button { display:inline-block; border-radius:7px; padding:10px 18px; font-weight:600; text-decoration:none; }
+.actions.split { justify-content:space-between; flex-wrap:wrap; gap:12px; }
+form.restore { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+form.restore input[type=file] { width:auto; padding:6px; }
 button.link { background:none; color:var(--muted); padding:0; font-weight:400; }
 .flash { padding:12px 14px; border-radius:8px; border:1px solid var(--border); }
 .flash.ok { background:var(--okbg); } .flash.error { background:var(--badbg); }
@@ -441,6 +532,7 @@ main.wide { max-width:860px; }
 .line.agent .text { background:var(--okbg); }
 .line.partial .text { opacity:.6; font-style:italic; }
 .note { margin:4px 0 10px 62px; font-size:13px; color:var(--muted); }
-.status p { margin:0; } .dot { display:inline-block; width:10px; height:10px; border-radius:50%;
+.status p { margin:0; }
+[hidden] { display:none !important; } .dot { display:inline-block; width:10px; height:10px; border-radius:50%;
          background:var(--muted); margin-right:8px; } .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
 """
