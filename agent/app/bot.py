@@ -52,7 +52,7 @@ from pipecat.utils.text.base_text_filter import BaseTextFilter
 from pipecat.workers.runner import WorkerRunner
 
 from .asterisk import ASTERISK_FRAME_BYTES, ASTERISK_SAMPLE_RATE, AMIClient, AsteriskFrameSerializer
-from . import settings
+from . import handover, settings
 from .live import TranscriptTap, bus
 from .recorder import CallerAudioRecorder
 from .triage.prompts import greeting, instructions
@@ -436,6 +436,12 @@ def _tools(
             "character by character."
         )
 
+    def handover_text(args: dict) -> str:
+        briefing = (args.get("handover") or args.get("reason") or "").strip()
+        if call.ticket_id and call.ticket_id not in briefing:
+            briefing += f" The ticket reference is {call.ticket_id}."
+        return f"Hi, it's the AI assistant with a transfer. {briefing} Connecting you now."
+
     @tool_options(cancel_on_interruption=False)
     async def transfer_to_human(params: FunctionCallParams) -> None:
         call.transfer_started = True
@@ -448,10 +454,31 @@ def _tools(
             )
             return
 
-        note(f"📞 Transferring to {transfer_target}: {params.arguments.get('reason', '')}")
-        await speech.say_and_wait(params.llm, "I'm transferring you to an engineer now. Please stay on the line.")
-        logger.info(f"Transferring {call.channel} to {transfer_target}: {params.arguments.get('reason')}")
+        reason = params.arguments.get("reason", "")
+        announced = cfg["TRANSFER_MODE"] == "announced"
+        note(f"📞 Transferring to {transfer_target}: {reason}")
+        if announced:
+            # Record the engineer's briefing while the caller hears this.
+            text = handover_text(params.arguments)
+            briefing = asyncio.create_task(handover.record(cfg, text))
+            await speech.say_and_wait(
+                params.llm,
+                "I'm transferring you to an engineer now. I'll quickly fill them in, so please stay on the line.",
+            )
+            try:
+                handover_id = await briefing
+                note(f"🗣️ Engineer will hear: {text}")
+            except Exception:
+                logger.exception("Couldn't record the handover; transferring without it")
+                note("⚠️ Couldn't record the engineer's briefing, so transferring without it")
+                handover_id = ""
+        else:
+            await speech.say_and_wait(params.llm, "I'm transferring you to an engineer now. Please stay on the line.")
+        logger.info(f"Transferring {call.channel} to {transfer_target}: {reason}")
         try:
+            if announced and handover_id:
+                # Tells the transfer dialplan to play this to the engineer before connecting the caller.
+                await ami.setvar(call.channel, "TRANSFER_HANDOVER", handover_id)
             # Moves the caller's leg to the transfer dialplan, which also ends this session.
             await ami.redirect(call.channel, "agent-transfer", transfer_target)
         except Exception:
@@ -510,8 +537,18 @@ def _tools(
                 "the caller asks for a person. Create the ticket first if you have enough information. "
                 "This tool tells the caller they're being transferred, so don't announce it yourself."
             ),
-            properties={"reason": {"type": "string", "description": "Why the call is being transferred"}},
-            required=["reason"],
+            properties={
+                "reason": {"type": "string", "description": "Why the call is being transferred"},
+                "handover": {
+                    "type": "string",
+                    "description": "Spoken to the engineer before they're connected, in one to three short "
+                    "sentences: who is calling (name and organisation), the issue and its impact, the "
+                    "priority, and the ticket reference if one was created. Plain spoken English, e.g. "
+                    "'I've got Jane Smith from Acme on the line. Their whole office has lost internet since "
+                    "9am. I've logged it as a P1.'",
+                },
+            },
+            required=["reason", "handover"],
             handler=transfer_to_human,
         ),
         FunctionSchema(

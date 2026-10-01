@@ -224,6 +224,12 @@ FIELDS: tuple[Field, ...] = (
     Field("TRANSFER_TARGET", "Transfer calls to", "3CX extension",
           "3CX extension, ring group or queue for human transfers, e.g. 810. Empty = no transfers",
           validate=_pattern(r"[0-9*#]+", "Digits only")),
+    Field("TRANSFER_MODE", "Transfer type", "3CX extension",
+          "Announced: when the engineer answers, the agent tells them who's calling and why, then "
+          "connects the caller. Blind: hands the call straight to 3CX. Use Blind for 3CX queues, which "
+          "answer before an engineer picks up, so the engineer would miss the announcement",
+          default="announced", choices=("announced", "blind"),
+          labels=("Announced (agent briefs the engineer first)", "Blind")),
     # Server
     Field("PUBLIC_IP", "Server public IP", "Server", "So 3CX can send call audio back to this server",
           asterisk=True, validate=_ip),

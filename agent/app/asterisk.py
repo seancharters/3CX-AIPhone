@@ -96,6 +96,10 @@ class AMIClient:
         """Move `channel` to `context`/`exten`, priority 1. Raises on failure."""
         await self._run(Action="Redirect", Channel=channel, Context=context, Exten=exten, Priority="1")
 
+    async def setvar(self, channel: str, variable: str, value: str) -> None:
+        """Set a variable on `channel` (it stays set after a redirect). Raises on failure."""
+        await self._run(Action="Setvar", Channel=channel, Variable=variable, Value=value)
+
     async def command(self, command: str) -> str:
         """Run an Asterisk CLI command and return its output."""
         response = await self._run(Action="Command", Command=command)

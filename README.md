@@ -122,6 +122,7 @@ All switchable in the admin page, taking effect on the next call:
 | Call connects but one-way or no audio | Server public IP wrong, or UDP 10000-10099 not open |
 | Call answers then hangs up straight away | An API key is wrong. Check `docker compose logs agent` |
 | Transfer doesn't reach the engineer | Check "Transfer calls to" in the admin page. If 3CX refuses the SIP transfer, Asterisk falls back to dialling the target through 3CX |
+| Engineer doesn't hear the briefing | "Transfer type" is Announced, which dials the target through 3CX and briefs whoever answers first. 3CX queues answer before an engineer picks up, so use Blind for queues |
 
 ```bash
 docker compose exec asterisk asterisk -rvvv                        # Asterisk console
