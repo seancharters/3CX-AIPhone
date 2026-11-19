@@ -212,6 +212,42 @@ FIELDS: tuple[Field, ...] = (
     Field("SMTP_USERNAME", "SMTP username", "Email tickets", "Leave empty if the server doesn't need a login"),
     Field("SMTP_PASSWORD", "SMTP password", "Email tickets",
           "For Microsoft 365, SMTP AUTH must be enabled on the mailbox", secret=True),
+    # Password resets
+    Field("PASSWORD_RESET_ENABLED", "Password resets", "Password resets",
+          "Lets the agent reset Microsoft 365 / Entra passwords for callers it has verified: by employee ID "
+          "if their Entra account has one, otherwise by a code sent by SMS to the mobile number on their "
+          "account. Admin accounts and on-premises synced accounts are never reset by phone",
+          default="no", choices=("no", "yes"), labels=("Off", "On")),
+    Field("ENTRA_TENANT_ID", "Entra tenant ID", "Password resets",
+          "Entra admin centre → Overview → Tenant ID",
+          validate=_pattern(r"[0-9a-fA-F-]{36}|[A-Za-z0-9.-]+\.[A-Za-z]+", "A tenant ID (GUID) or domain")),
+    Field("ENTRA_CLIENT_ID", "App (client) ID", "Password resets",
+          "From the app registration. Application permissions (admin consented): User.Read.All, "
+          "User-PasswordProfile.ReadWrite.All, RoleManagement.Read.Directory, plus GroupMember.Read.All if a "
+          "group is set below, and UserAuthenticationMethod.Read.All if SMS uses MFA numbers. Also assign the "
+          "app the Helpdesk Administrator role (Roles and administrators)",
+          validate=_pattern(r"[0-9a-fA-F-]{36}", "A GUID, e.g. 00000000-0000-0000-0000-000000000000")),
+    Field("ENTRA_CLIENT_SECRET", "Client secret", "Password resets",
+          "The secret's Value (not its ID). Note when it expires", secret=True),
+    Field("RESET_ALLOWED_GROUP_ID", "Only allow resets for group", "Password resets",
+          "Optional. Object ID of an Entra group: only its members (including nested) can be reset by phone. "
+          "Empty = any enabled, cloud-only, non-admin member account",
+          validate=_pattern(r"[0-9a-fA-F-]{36}", "A group object ID (GUID)")),
+    Field("SMS_PHONE_SOURCE", "SMS codes go to", "Password resets",
+          "Which phone number on the account receives verification codes. Only used when the account has "
+          "no employee ID", default="mobile", choices=("mobile", "mfa", "either"),
+          labels=("Mobile phone on the user's profile", "Mobile number registered for MFA",
+                  "Profile mobile, or MFA number if that's empty")),
+    Field("SMTP2GO_API_KEY", "SMTP2GO API key", "Password resets",
+          "Sends verification codes to callers whose account has no employee ID. Without it, only callers "
+          "with an employee ID can be verified. SMTP2GO → Sending → API Keys; the key needs SMS access",
+          secret=True),
+    Field("SMS_SENDER", "SMS sender number", "Password resets",
+          "Optional, in +61... format. Empty = your SMTP2GO default sender",
+          validate=_pattern(r"\+[1-9][0-9]{7,14}", "International format, e.g. +61412345678")),
+    Field("SMS_COUNTRY_CODE", "Default country code", "Password resets",
+          "Used for numbers stored without one in Entra, e.g. 0412 345 678", default="61",
+          validate=_pattern(r"[1-9][0-9]{0,2}", "Digits only, e.g. 61")),
     # 3CX
     Field("THREECX_HOST", "3CX FQDN", "3CX extension", "e.g. yourcompany.3cx.com.au", asterisk=True,
           validate=_pattern(r"[A-Za-z0-9.-]+", "A hostname, e.g. yourcompany.3cx.com.au")),
@@ -267,6 +303,9 @@ SHOW_IF: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "ELEVENLABS_VOICE_ID": ((TTS, ("elevenlabs",)),),
     "ELEVENLABS_MODEL": ((TTS, ("elevenlabs",)),),
     "STT_VOCABULARY": ((STT, ("azure", "elevenlabs")),),
+    **{k: (("PASSWORD_RESET_ENABLED", ("yes",)),) for k in (
+        "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "ENTRA_CLIENT_SECRET", "RESET_ALLOWED_GROUP_ID",
+        "SMS_PHONE_SOURCE", "SMTP2GO_API_KEY", "SMS_SENDER", "SMS_COUNTRY_CODE")},
     **{k: ((EMAIL, ("yes",)),) for k in (
         "EMAIL_TO", "EMAIL_FROM", "SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_USERNAME", "SMTP_PASSWORD")},
 }

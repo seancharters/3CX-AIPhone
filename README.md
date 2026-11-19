@@ -44,13 +44,15 @@ In the 3CX admin console (v20):
 Any Linux VM with Docker works. Put it in Sydney (e.g. AWS Lightsail/EC2 `ap-southeast-2`,
 2 vCPU / 2 GB) so callers hear fast responses.
 
-**Firewall:** allow inbound UDP `5060` and UDP `10000-10099` (call audio). Nothing else needs to be
-open. Ideally restrict both to your 3CX's IP.
+**Firewall:** no inbound ports are required. Asterisk registers *out* to 3CX and keeps that
+connection alive, so incoming calls and call audio come back as replies through the server's
+stateful firewall (e.g. an Azure NSG or AWS security group). Just allow outbound UDP to your 3CX
+(`5060` and its RTP ports) and HTTPS to the AI providers, which most clouds allow by default.
+Reach the server for admin over SSH (or Azure Bastion), ideally limited to your own IP.
 
 ```bash
 git clone <this repo> ai-phone && cd ai-phone
 docker compose up -d --build       # first build compiles Asterisk: ~5-10 min
-docker compose logs admin          # shows the one-time setup code for the admin page
 ```
 
 ## 3. Configure in the admin page
@@ -63,7 +65,7 @@ ssh -L 8000:localhost:8000 you@your-server
 # then open http://localhost:8000
 ```
 
-1. **First visit:** enter the setup code from `docker compose logs admin` and choose an admin password.
+1. **First visit:** you're asked to create an admin password.
 2. Fill in:
    - **Providers:** speech-to-text and AI model (Azure by default; Deepgram and Claude are alternatives)
    - **Azure:** Azure OpenAI endpoint, key and deployment name; Speech region (and key, if it's a
@@ -85,7 +87,7 @@ last 10 calls in memory (cleared when the agent restarts; nothing is written to 
 
 Saved keys are never shown again. Leave a key field blank to keep the stored value.
 Forgot the admin password? `docker compose exec admin rm /data/admin.json && docker compose restart admin`,
-then use the new setup code from the logs.
+then open the page again to create a new one.
 
 Then **call extension 800** from any 3CX phone. To put it in front of customers, add an option to
 your 3CX **Digital Receptionist** (e.g. "press 1 for IT support") that goes to extension 800.
@@ -119,7 +121,7 @@ All switchable in the admin page, taking effect on the next call:
 | Symptom | Likely cause |
 |---|---|
 | Admin page shows `Rejected` | Wrong Auth ID/password (use the Auth ID, not the extension number), or 3CX blocking use outside the LAN |
-| Call connects but one-way or no audio | Server public IP wrong, or UDP 10000-10099 not open |
+| Call connects but one-way or no audio | Server public IP wrong in the admin page, or outbound UDP to 3CX's RTP ports blocked |
 | Call answers then hangs up straight away | An API key is wrong. Check `docker compose logs agent` |
 | Transfer doesn't reach the engineer | Check "Transfer calls to" in the admin page. If 3CX refuses the SIP transfer, Asterisk falls back to dialling the target through 3CX |
 | Engineer doesn't hear the briefing | "Transfer type" is Announced, which dials the target through 3CX and briefs whoever answers first. 3CX queues answer before an engineer picks up, so use Blind for queues |
@@ -139,6 +141,32 @@ With **Email tickets** on, each ticket is emailed as soon as the agent creates i
 Tickets are always saved on the server too, so a mail problem never loses one (it's logged in
 `docker compose logs agent`). For Microsoft 365: `smtp.office365.com`, port 587, STARTTLS, and SMTP AUTH
 enabled on the sending mailbox.
+
+## Password resets (optional)
+
+With **Password resets** on, the agent can reset a caller's Microsoft 365 / Entra password once it
+has verified them:
+1. It looks up their account by work email (or full name).
+2. **Employee ID on the account?** The caller must say it (3 attempts).
+   **No employee ID?** A six-digit code is texted via SMTP2GO to the mobile number *on the account*
+   (never a number the caller gives). 3 attempts per code, 2 codes per call, codes expire in 10 minutes.
+3. It sets a temporary password (e.g. `Maple-River-4827`) that must be changed at next sign-in, and
+   reads it to the caller twice. The password is never shown to the AI model, written to tickets or
+   shown in Live calls. Employee IDs and SMS codes are removed from ticket transcripts.
+
+Every check is enforced in code (`agent/app/identity.py`), not by the AI. Accounts with any Entra admin
+role, disabled accounts and on-premises synced accounts are never reset by phone. Five failed
+verifications in an hour, or three resets in a day, pause phone resets for that account. Every attempt
+is logged to `/srv/tickets/password-resets.log` in the agent container.
+
+**Entra setup:** Entra admin centre → App registrations → New registration. Under **API permissions**
+add Microsoft Graph *Application* permissions `User.Read.All`, `User-PasswordProfile.ReadWrite.All`
+and `RoleManagement.Read.Directory` (plus `GroupMember.Read.All` if you restrict resets to a group, and
+`UserAuthenticationMethod.Read.All` if SMS codes go to MFA numbers), then **Grant admin consent**.
+Create a client secret. Then **Roles and administrators → Helpdesk Administrator → Add assignments**
+and add the app. Enter the tenant ID, client ID and secret in the admin page and use **Save and test Entra**.
+
+**SMS:** create an SMTP2GO API key with SMS access, enter it, and use **Save and send test SMS**.
 
 ## Next steps
 

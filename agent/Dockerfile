@@ -5,6 +5,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+# Readable by the agent user even if the checkout lost its permissions (e.g. synced via OneDrive).
+RUN chmod -R a+rX /srv/app
 RUN useradd --system --create-home agent && mkdir -p /srv/tickets /data && chown agent /srv/tickets /data
 USER agent
 

@@ -14,6 +14,7 @@ Event shapes (all include "call_id" and "time"):
 from __future__ import annotations
 
 import asyncio
+import re
 import itertools
 import time
 from collections import OrderedDict
@@ -84,6 +85,12 @@ class TranscriptTap(FrameProcessor):
         self._speaker = speaker
         self._line_id: str | None = None
         self._text = ""
+        # Lines containing any of these words are shown as a placeholder, e.g. a temporary password.
+        self._redact: dict[str, str] = {}
+
+    def redact(self, words: list[str], label: str) -> None:
+        for w in words:
+            self._redact[w.lower()] = label
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -122,6 +129,11 @@ class TranscriptTap(FrameProcessor):
         text = self._text.strip()
         if not text:
             return
+        lowered = text.lower()
+        for word, label in self._redact.items():
+            if re.search(rf"\b{re.escape(word)}\b", lowered):
+                text = label
+                break
         if self._line_id is None:
             self._line_id = bus.new_id()
         bus.publish(

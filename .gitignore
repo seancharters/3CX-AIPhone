@@ -4,3 +4,6 @@ voice-samples/
 .DS_Store
 .env
 *.wav
+
+# Settings backups from the admin page contain API keys and passwords
+*-backup-*.json

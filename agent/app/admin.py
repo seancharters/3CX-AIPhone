@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from loguru import logger
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import settings
+from . import identity, settings
 from .asterisk import AMIClient
 from .triage import tickets
 
@@ -57,11 +57,11 @@ def _set_password(password: str) -> None:
     settings._write_private(ADMIN_FILE, json.dumps({"salt": salt.hex(), "hash": _hash(password, salt)}))
 
 
-# One-time code needed to create the admin password, so whoever reaches the page first
-# can't claim it. Printed in the logs: docker compose logs admin
-SETUP_CODE = secrets.token_hex(4) if not _password_set() else ""
-if SETUP_CODE:
-    logger.warning(f"Admin UI first-time setup code: {SETUP_CODE}")
+# Until an admin password exists, the first visitor is asked to create one. That's safe because
+# the admin port is only published on the server's loopback (see docker-compose.yml), so only
+# someone already on the server, or tunnelled in over SSH, can reach it. Don't expose the port
+# publicly before the password is set.
+_setup_lock = asyncio.Lock()  # two simultaneous first visits can't both set the password
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(SessionMiddleware, secret_key=_session_secret(), same_site="strict", max_age=8 * 3600)
@@ -133,6 +133,51 @@ async def test_email(request: Request):
     except Exception as e:
         logger.warning(f"Test email failed: {e!r}")
         request.session["flash"] = ("error", f"Saved, but the test email failed: {type(e).__name__}: {e}")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/test-entra", response_class=HTMLResponse)
+async def test_entra(request: Request):
+    if not request.session.get("admin"):
+        return RedirectResponse("/login", status_code=303)
+    _, cfg, error = _apply_form(await request.form())
+    if error:
+        return _page("Settings", _settings_form(cfg, ("error", error)), nav=True)
+    missing = [settings.FIELDS_BY_KEY[k].label for k in ("ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "ENTRA_CLIENT_SECRET")
+               if not cfg[k]]
+    if missing:
+        request.session["flash"] = ("error", f"Saved, but can't test Entra yet. Fill in: {', '.join(missing)}.")
+        return RedirectResponse("/", status_code=303)
+    try:
+        request.session["flash"] = ("ok", "Saved. " + await identity.test_connection(cfg))
+    except identity.IdentityError as err:
+        request.session["flash"] = ("error", f"Saved, but the Entra test failed: {err}")
+    except Exception as err:
+        logger.warning(f"Entra test failed: {err!r}")
+        request.session["flash"] = ("error", f"Saved, but the Entra test failed: {type(err).__name__}: {err}")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/test-sms", response_class=HTMLResponse)
+async def test_sms(request: Request):
+    if not request.session.get("admin"):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    _, cfg, error = _apply_form(form)
+    if error:
+        return _page("Settings", _settings_form(cfg, ("error", error)), nav=True)
+    number = identity.to_e164(str(form.get("test_sms_to", "")), cfg["SMS_COUNTRY_CODE"])
+    if not cfg["SMTP2GO_API_KEY"] or not number:
+        request.session["flash"] = ("error", "Saved, but can't send a test SMS: enter the SMTP2GO API key and a "
+                                    "mobile number to send it to.")
+        return RedirectResponse("/", status_code=303)
+    try:
+        await identity.send_sms(cfg, number, "Test message from the IT support phone agent. SMS verification "
+                                "codes will arrive like this.")
+        request.session["flash"] = ("ok", f"Saved, and a test SMS was sent to {number}.")
+    except Exception as err:
+        logger.warning(f"Test SMS failed: {err!r}")
+        request.session["flash"] = ("error", f"Saved, but the test SMS failed: {err}")
     return RedirectResponse("/", status_code=303)
 
 
@@ -241,16 +286,13 @@ async def setup_page():
 
 
 @app.post("/setup", response_class=HTMLResponse)
-async def setup(request: Request, code: str = Form(""), password: str = Form(""), confirm: str = Form("")):
-    if _password_set():
-        return RedirectResponse("/login", status_code=303)
-    # No code means the password was removed while running: restart to get a fresh one.
-    if not SETUP_CODE or not hmac.compare_digest(code.strip(), SETUP_CODE):
-        await asyncio.sleep(1)
-        return _page("First-time setup", _setup_form("That setup code isn't right. Find it with: docker compose logs admin"))
+async def setup(request: Request, password: str = Form(""), confirm: str = Form("")):
     if len(password) < MIN_PASSWORD or password != confirm:
         return _page("First-time setup", _setup_form(f"Passwords must match and be at least {MIN_PASSWORD} characters."))
-    _set_password(password)
+    async with _setup_lock:
+        if _password_set():
+            return RedirectResponse("/login", status_code=303)
+        _set_password(password)
     request.session["admin"] = True
     return RedirectResponse("/", status_code=303)
 
@@ -303,6 +345,18 @@ def _settings_form(values: dict[str, str], flash: tuple[str, str] | None) -> str
                 + '><button type="submit" formaction="/test-email" class="secondary">'
                 "Save and send test email</button></div>"
             )
+        if section == "Password resets":
+            parts.append(
+                '<div class="field" data-show-if=\'{"PASSWORD_RESET_ENABLED": ["yes"]}\''
+                + ("" if values.get("PASSWORD_RESET_ENABLED") == "yes" else ' hidden')
+                + '><label for="test_sms_to">Send a test SMS to</label>'
+                '<input id="test_sms_to" name="test_sms_to" placeholder="e.g. 0412 345 678">'
+                "<small>Not saved. Only used by the test SMS button</small></div>"
+                '<div class="actions gap" data-show-if=\'{"PASSWORD_RESET_ENABLED": ["yes"]}\''
+                + ("" if values.get("PASSWORD_RESET_ENABLED") == "yes" else ' hidden')
+                + '><button type="submit" formaction="/test-sms" class="secondary">Save and send test SMS</button>'
+                '<button type="submit" formaction="/test-entra" class="secondary">Save and test Entra</button></div>'
+            )
         parts.append("</section>")
     parts.append('<div class="actions"><button type="submit">Save settings</button></div></form>')
     parts.append(_BACKUP_CARD)
@@ -349,11 +403,9 @@ def _setup_form(error: str = "") -> str:
     err = f'<p class="flash error">{e(error)}</p>' if error else ""
     return (
         f'{err}<form method="post" class="card narrow">'
-        "<p>Create the admin password. You'll need the one-time setup code from the server:<br>"
-        "<code>docker compose logs admin</code></p>"
-        '<div class="field"><label for="code">Setup code</label><input id="code" name="code" required></div>'
+        f"<p>Welcome. Create the admin password for this page (at least {MIN_PASSWORD} characters).</p>"
         f'<div class="field"><label for="password">New password</label><input id="password" name="password" '
-        f'type="password" minlength="{MIN_PASSWORD}" required autocomplete="new-password"></div>'
+        f'type="password" minlength="{MIN_PASSWORD}" required autofocus autocomplete="new-password"></div>'
         '<div class="field"><label for="confirm">Confirm password</label><input id="confirm" name="confirm" '
         'type="password" required autocomplete="new-password"></div>'
         '<div class="actions"><button type="submit">Create password</button></div></form>'
@@ -511,6 +563,7 @@ button { background:var(--accent); color:#fff; border:0; border-radius:7px; padd
          font-weight:600; cursor:pointer; }
 button.secondary, a.button.secondary { background:none; color:var(--accent); border:1px solid var(--accent); }
 a.button { display:inline-block; border-radius:7px; padding:10px 18px; font-weight:600; text-decoration:none; }
+.actions.gap { gap:10px; flex-wrap:wrap; }
 .actions.split { justify-content:space-between; flex-wrap:wrap; gap:12px; }
 form.restore { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 form.restore input[type=file] { width:auto; padding:6px; }
