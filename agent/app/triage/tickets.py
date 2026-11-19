@@ -1,10 +1,8 @@
 """Ticket storage.
 
-Every ticket is saved as a JSON file under TICKETS_DIR. When email tickets are enabled in the
-admin UI, it's also emailed, so you can see how a ticket would arrive in a helpdesk inbox.
-
-To connect a real PSA/helpdesk later (HaloPSA, ConnectWise, Freshdesk...), add a class with the
-same `create` method that calls its API, and return it from `get_ticket_store`.
+Every ticket is saved as a JSON file under TICKETS_DIR first, so nothing is lost if a later step
+fails. Then, depending on the admin settings, it's created in the PSA (ConnectWise or HaloPSA,
+see app/psa.py) and/or emailed. The PSA's ticket number is read to the caller when there is one.
 """
 
 from __future__ import annotations
@@ -26,6 +24,8 @@ from typing import Any, Protocol
 
 from loguru import logger
 
+from .. import psa as psa_mod
+
 
 @dataclass
 class Ticket:
@@ -40,6 +40,9 @@ class Ticket:
     priority: str
     caller_id: str | None = None
     transcript: list[dict[str, Any]] = field(default_factory=list)
+    # PSA contact the ticket is linked to, or just their company (e.g. matched by caller ID only).
+    contact: psa_mod.Contact | None = None
+    company_id: str = ""
 
 
 class TicketStore(Protocol):
@@ -63,37 +66,70 @@ class LocalTicketStore:
         await self.save(ref, ticket)
         return ref
 
-    async def save(self, ref: str, ticket: Ticket) -> None:
-        record = {"reference": ref, "created_at": datetime.now(timezone.utc).isoformat(), **asdict(ticket)}
+    async def save(self, ref: str, ticket: Ticket, **extra: Any) -> None:
+        record = {"reference": ref, "created_at": datetime.now(timezone.utc).isoformat(), **extra,
+                  **asdict(ticket)}
         path = self._dir / f"{ref}.json"
         await asyncio.to_thread(path.write_text, json.dumps(record, indent=2, default=str))
 
 
-class EmailTicketStore:
-    """Saves the ticket locally, then emails it. A failed email never loses the ticket."""
+class TicketPipeline:
+    """Saves the ticket locally, then creates it in the PSA and/or emails it, as configured.
+    A failure in the PSA or email never loses the ticket: the local reference is used instead."""
 
-    def __init__(self, cfg: dict[str, str], local: LocalTicketStore) -> None:
+    def __init__(self, cfg: dict[str, str], local: LocalTicketStore, psa: psa_mod.PSA | None) -> None:
         self._cfg = cfg
         self._local = local
+        self._psa = psa
+        self.last_error = ""  # why the PSA step failed, for the Live calls page
 
     async def create(self, ticket: Ticket) -> str:
         ref = await self._local.create(ticket)
-        try:
-            await asyncio.to_thread(send_email, self._cfg, ticket_email(self._cfg, ref, ticket))
-            logger.info(f"Emailed ticket {ref} to {self._cfg['EMAIL_TO']}")
-        except Exception:
-            logger.exception(f"Couldn't email ticket {ref}; it's saved in {TICKETS_DIR}")
+        if self._psa:
+            try:
+                psa_ref = await self._psa.create_ticket(psa_request(ticket))
+                logger.info(f"Created {self._psa.name} ticket {psa_ref} (local copy {ref})")
+                await self._local.save(ref, ticket, psa=self._psa.name, psa_ticket=psa_ref)
+                ref = psa_ref
+            except psa_mod.PSAError as err:
+                self.last_error = str(err)
+                logger.error(f"Couldn't create the {self._psa.name} ticket ({err}); using local reference {ref}")
+            except Exception as err:
+                self.last_error = f"{type(err).__name__}: {err}"
+                logger.exception(f"Couldn't create the {self._psa.name} ticket; using local reference {ref}")
+        if self._cfg.get("TICKET_EMAIL_ENABLED") == "yes":
+            try:
+                await asyncio.to_thread(send_email, self._cfg, ticket_email(self._cfg, ref, ticket))
+                logger.info(f"Emailed ticket {ref} to {self._cfg['EMAIL_TO']}")
+            except Exception:
+                logger.exception(f"Couldn't email ticket {ref}; it's saved in {TICKETS_DIR}")
         return ref
 
 
 TICKETS_DIR = Path(os.getenv("TICKETS_DIR", "tickets"))
 
 
-def get_ticket_store(cfg: dict[str, str]) -> TicketStore:
-    local = LocalTicketStore(TICKETS_DIR)
-    if cfg.get("TICKET_EMAIL_ENABLED") == "yes":
-        return EmailTicketStore(cfg, local)
-    return local
+def get_ticket_store(cfg: dict[str, str]) -> TicketPipeline:
+    return TicketPipeline(cfg, LocalTicketStore(TICKETS_DIR), psa_mod.get(cfg))
+
+
+def psa_request(t: Ticket) -> psa_mod.TicketRequest:
+    details = [
+        t.description, "",
+        f"Caller: {t.caller_name} ({t.organisation})",
+        f"Callback number: {t.callback_phone}",
+        f"Caller ID: {t.caller_id or 'withheld'}",
+        f"Email: {t.email or 'not given'}",
+        f"Affected: {t.affected_users}",
+        f"Category: {t.category.replace('_', ' ')}",
+        "", "Logged by the AI phone agent.",
+    ]
+    note = "Call transcript\n\n" + "\n".join(f"{who}: {said}" for who, said in _transcript_lines(t.transcript))
+    return psa_mod.TicketRequest(
+        summary=t.summary, description="\n".join(details), internal_note=note, priority=t.priority,
+        caller_name=t.caller_name, callback_phone=t.callback_phone, email=t.email,
+        contact=t.contact, company_id=t.company_id,
+    )
 
 
 # --- email --------------------------------------------------------------------------------

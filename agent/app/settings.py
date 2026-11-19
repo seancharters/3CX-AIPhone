@@ -212,6 +212,64 @@ FIELDS: tuple[Field, ...] = (
     Field("SMTP_USERNAME", "SMTP username", "Email tickets", "Leave empty if the server doesn't need a login"),
     Field("SMTP_PASSWORD", "SMTP password", "Email tickets",
           "For Microsoft 365, SMTP AUTH must be enabled on the mailbox", secret=True),
+    # Helpdesk (PSA)
+    Field("PSA_PROVIDER", "Helpdesk (PSA)", "Helpdesk (PSA)",
+          "Creates tickets in your PSA and reads its ticket number to the caller. Tickets are always saved on "
+          "the server too, so if the PSA can't be reached the caller still gets a reference",
+          default="none", choices=("none", "connectwise", "halopsa"),
+          labels=("None: save tickets on the server (and email them if on)", "ConnectWise PSA (Manage)", "HaloPSA")),
+    Field("PSA_CALLER_LOOKUP", "Recognise callers by caller ID", "Helpdesk (PSA)",
+          "Looks up the caller's number in the PSA when the call is answered. If it matches a contact, the "
+          "agent confirms their details instead of asking for them, and links the ticket to them. Callers who "
+          "don't match are looked up by the email address they give",
+          default="yes", choices=("yes", "no"), labels=("On", "Off")),
+    Field("CW_SITE", "ConnectWise site", "Helpdesk (PSA)",
+          "The API host for your ConnectWise cloud region, e.g. api-au.myconnectwise.net (Australia), "
+          "api-na.myconnectwise.net, api-eu.myconnectwise.net, or your own server's hostname",
+          validate=_pattern(r"(https://)?[A-Za-z0-9.-]+/?", "A hostname, e.g. api-au.myconnectwise.net")),
+    Field("CW_COMPANY_ID", "Company ID", "Helpdesk (PSA)", "The company you enter when signing in to ConnectWise",
+          validate=_pattern(r"[A-Za-z0-9_.-]+", "Letters, numbers and _ . - only")),
+    Field("CW_PUBLIC_KEY", "Public key", "Helpdesk (PSA)",
+          "System → Members → API Members → New. Give the member a security role that can read companies and "
+          "contacts and add service tickets. Then its API Keys tab → New",
+          validate=_pattern(r"[A-Za-z0-9]+", "Letters and numbers only")),
+    Field("CW_PRIVATE_KEY", "Private key", "Helpdesk (PSA)", "Shown once, when the API key is created", secret=True),
+    Field("CW_CLIENT_ID", "Client ID", "Helpdesk (PSA)",
+          "ConnectWise requires one for every integration: developer.connectwise.com → Client IDs (free)",
+          validate=_pattern(r"[0-9a-fA-F-]{36}", "A GUID, e.g. 00000000-0000-0000-0000-000000000000")),
+    Field("CW_BOARD_ID", "Service board ID", "Helpdesk (PSA)",
+          "Board new tickets go on. Save and test lists the boards and their IDs",
+          validate=_pattern(r"[0-9]+", "Digits only")),
+    Field("CW_PRIORITY_IDS", "Priority IDs for P1, P2, P3, P4", "Helpdesk (PSA)",
+          "ConnectWise priority IDs in order, e.g. 6,15,8,7. Empty = the board's default priority. Save and test "
+          "lists them", validate=_pattern(r"[0-9]+(,[0-9]+){3}", "Four IDs separated by commas, e.g. 6,15,8,7")),
+    Field("CW_DEFAULT_COMPANY", "Company for unknown callers", "Helpdesk (PSA)",
+          "Tickets from callers who aren't a ConnectWise contact go to this company: its identifier (e.g. "
+          "Catchall) or record ID. The caller's details are in the ticket",
+          validate=_pattern(r"[A-Za-z0-9 _.&'-]+", "A company identifier or ID")),
+    Field("HALO_URL", "HaloPSA URL", "Helpdesk (PSA)", "e.g. https://yourcompany.halopsa.com", validate=_https_url),
+    Field("HALO_CLIENT_ID", "Client ID", "Helpdesk (PSA)",
+          "Configuration → Integrations → HaloPSA API → View Applications → New. Authentication method: Client "
+          "ID and Secret (Services). Log in as an agent who can see all clients. Permissions: read:customers "
+          "and edit:tickets", validate=_pattern(r"[A-Za-z0-9-]+", "Letters, numbers and - only")),
+    Field("HALO_CLIENT_SECRET", "Client secret", "Helpdesk (PSA)", secret=True),
+    Field("HALO_TENANT", "Tenant", "Helpdesk (PSA)",
+          "Usually empty. Only if Configuration → Integrations → HaloPSA API shows a tenant name",
+          validate=_pattern(r"[A-Za-z0-9_-]+", "Letters, numbers and _ - only")),
+    Field("HALO_TICKET_TYPE_ID", "Ticket type ID", "Helpdesk (PSA)",
+          "Empty = Halo's default ticket type. Save and test lists them", validate=_pattern(r"[0-9]+", "Digits only")),
+    Field("HALO_PRIORITY_IDS", "Priority IDs for P1, P2, P3, P4", "Helpdesk (PSA)",
+          "Halo priority IDs in order, e.g. 1,2,3,4. Empty = the ticket type's default. Save and test lists them",
+          validate=_pattern(r"[0-9]+(,[0-9]+){3}", "Four IDs separated by commas, e.g. 1,2,3,4")),
+    Field("HALO_DEFAULT_CLIENT_ID", "Client ID for unknown callers", "Helpdesk (PSA)",
+          "Tickets from callers who aren't a Halo user go to this client, e.g. one called Unknown Callers. "
+          "Customers → open the client → its ID is in the URL", validate=_pattern(r"[0-9]+", "Digits only")),
+    # Dropped calls
+    Field("DROPPED_CALL_TICKETS", "Ticket for dropped calls", "Dropped calls",
+          "If a call ends before a ticket is logged (the caller hangs up or the line drops), log a P3 "
+          "\"call back\" ticket with their caller ID and what they said. Not for calls the agent ended or "
+          "transferred to an engineer", default="spoke", choices=("spoke", "always", "off"),
+          labels=("If the caller said anything", "Every call, even hang-ups during the greeting", "Off")),
     # Password resets
     Field("PASSWORD_RESET_ENABLED", "Password resets", "Password resets",
           "Lets the agent reset Microsoft 365 / Entra passwords for callers it has verified: by employee ID "
@@ -306,6 +364,13 @@ SHOW_IF: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     **{k: (("PASSWORD_RESET_ENABLED", ("yes",)),) for k in (
         "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "ENTRA_CLIENT_SECRET", "RESET_ALLOWED_GROUP_ID",
         "SMS_PHONE_SOURCE", "SMTP2GO_API_KEY", "SMS_SENDER", "SMS_COUNTRY_CODE")},
+    "PSA_CALLER_LOOKUP": (("PSA_PROVIDER", ("connectwise", "halopsa")),),
+    **{k: (("PSA_PROVIDER", ("connectwise",)),) for k in (
+        "CW_SITE", "CW_COMPANY_ID", "CW_PUBLIC_KEY", "CW_PRIVATE_KEY", "CW_CLIENT_ID", "CW_BOARD_ID",
+        "CW_PRIORITY_IDS", "CW_DEFAULT_COMPANY")},
+    **{k: (("PSA_PROVIDER", ("halopsa",)),) for k in (
+        "HALO_URL", "HALO_CLIENT_ID", "HALO_CLIENT_SECRET", "HALO_TENANT", "HALO_TICKET_TYPE_ID",
+        "HALO_PRIORITY_IDS", "HALO_DEFAULT_CLIENT_ID")},
     **{k: ((EMAIL, ("yes",)),) for k in (
         "EMAIL_TO", "EMAIL_FROM", "SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_USERNAME", "SMTP_PASSWORD")},
 }

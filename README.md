@@ -142,6 +142,37 @@ Tickets are always saved on the server too, so a mail problem never loses one (i
 `docker compose logs agent`). For Microsoft 365: `smtp.office365.com`, port 587, STARTTLS, and SMTP AUTH
 enabled on the sending mailbox.
 
+## Helpdesk / PSA (optional)
+
+Under **Tickets → Helpdesk (PSA)** choose **ConnectWise PSA** or **HaloPSA**. Tickets are then created in
+the PSA and the agent reads out the PSA's ticket number. Every ticket is also saved on the server first,
+so if the PSA can't be reached the caller still gets a reference (starting `IT-`) and the failure shows in
+**Live calls**.
+
+- **Caller recognition:** when a call is answered, the caller ID is looked up. If it matches a contact,
+  the agent asks for the caller's name as usual and, if it matches, confirms their organisation and
+  email instead of asking for them. Numbers match on their last 9 digits, so `+61 412 345 678` and
+  `0412345678` are the same.
+- **Linking:** the ticket is linked to the caller ID's contact if the caller gave that contact's name;
+  otherwise to the contact with the email address the caller gave; otherwise to the caller ID's company;
+  otherwise to the **unknown callers** company/client you choose.
+- The call transcript goes in an internal note (ConnectWise: Internal Analysis; Halo: a private note).
+- **Dropped calls:** if a call ends before a ticket is logged (the caller hangs up or the line drops), a
+  P3 "call back" ticket is logged with their caller ID and everything they said. Calls the agent ended
+  itself or transferred are skipped. Set **Tickets → Dropped calls** to also cover hang-ups during the
+  greeting, or turn it off. This works without a PSA too: the ticket is saved and emailed as usual.
+- **Save and test connection** lists your boards/ticket types and priorities with their IDs, and can
+  look up a test number.
+
+**ConnectWise:** System → Members → API Members → add a member with a security role that can read
+companies and contacts and add service tickets, then create an API key. You also need a free Client ID
+from developer.connectwise.com. The site is your region's API host, e.g. `api-au.myconnectwise.net`.
+
+**HaloPSA:** Configuration → Integrations → HaloPSA API → View Applications → New. Authentication method
+**Client ID and Secret (Services)**, logged in as an agent who can see all clients, with the
+`read:customers` and `edit:tickets` permissions. Create a client such as "Unknown Callers" for callers
+who aren't in Halo, and enter its ID.
+
 ## Password resets (optional)
 
 With **Password resets** on, the agent can reset a caller's Microsoft 365 / Entra password once it

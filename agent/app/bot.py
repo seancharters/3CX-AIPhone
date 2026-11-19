@@ -57,7 +57,7 @@ from pipecat.utils.text.base_text_filter import BaseTextFilter
 from pipecat.workers.runner import WorkerRunner
 
 from .asterisk import ASTERISK_FRAME_BYTES, ASTERISK_SAMPLE_RATE, AMIClient, AsteriskFrameSerializer
-from . import handover, identity, settings
+from . import handover, identity, psa, settings
 from .live import TranscriptTap, bus
 from .recorder import CallerAudioRecorder
 from .triage.prompts import RESET_RULES, greeting, instructions
@@ -151,6 +151,10 @@ class CallInfo:
     ticket_priority: str = ""
     transfer_started: bool = False  # transfer_to_human has been called
     reset: identity.ResetSession = field(default_factory=identity.ResetSession)
+    # PSA contact(s) whose phone number matches the caller ID, if any.
+    psa_match: psa.Contact | list[psa.Contact] | None = None
+    psa_lookup: asyncio.Task | None = None  # still running if it was slow when the call was answered
+    ended_by_agent: bool = False  # end_call was used, so the call didn't just drop
 
 
 # The agent claiming a ticket is being created / exists, e.g. "I'll create a ticket for you",
@@ -840,6 +844,90 @@ def _reset_tools(
 
 
 
+async def link_contact(call: CallInfo, helpdesk: psa.PSA, ticket: Ticket, note) -> None:
+    """Works out which PSA contact (or company) the ticket belongs to."""
+    if call.psa_lookup and not call.psa_lookup.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(call.psa_lookup), 3)
+        except asyncio.TimeoutError:
+            pass
+    if call.psa_lookup and call.psa_lookup.done() and not call.psa_lookup.cancelled():
+        call.psa_match = call.psa_lookup.result()
+    ticket.contact, ticket.company_id = await psa.resolve_contact(
+        helpdesk, call.psa_match, ticket.caller_name, ticket.email)
+    if ticket.contact:
+        note(f"🔗 Linked to {helpdesk.name} contact {ticket.contact.name} ({ticket.contact.company_name})")
+    elif ticket.company_id:
+        note(f"🏢 Not matched to a contact; logging against the caller ID's company in {helpdesk.name}")
+    else:
+        note(f"❔ Caller not found in {helpdesk.name}; logging against the unknown-caller company")
+
+
+def _caller_lines(messages: list[dict]) -> list[str]:
+    lines = []
+    for m in messages:
+        content = m.get("content")
+        if m.get("role") != "user" or not isinstance(content, str):
+            continue
+        text = content.strip()
+        if text and not text.startswith(("[The call has just been answered", "[System note")):
+            lines.append(text)
+    return lines
+
+
+# Kept referenced so the garbage collector doesn't drop them before they finish.
+_background: set[asyncio.Task] = set()
+
+
+async def log_dropped_call(call: CallInfo, call_id: str, cfg: dict[str, str], messages: list[dict]) -> None:
+    """A call ended without a ticket (the caller hung up or the line dropped): log one so someone
+    can call them back."""
+    def note(text: str) -> None:
+        bus.publish({"type": "note", "call_id": call_id, "text": text})
+
+    messages = identity.redact_transcript(messages, call.reset.redact)
+    said = _caller_lines(messages)
+    number = call.caller_number or ""
+    match = call.psa_match if isinstance(call.psa_match, psa.Contact) else None
+    name = match.name if match else (call.caller_name or "Unknown caller")
+    heard = "\n".join(f"- {line}" for line in said) or "- (nothing: they hung up before speaking)"
+    ticket = Ticket(
+        caller_name=name,
+        organisation=match.company_name if match else "Unknown",
+        callback_phone=number or "withheld",
+        email="",
+        summary=(f"Call back {name if match else number}: call ended before a ticket was logged" if number
+                 else "Dropped call (number withheld): ended before a ticket was logged"),
+        description=(
+            "The call to the AI phone agent ended before a ticket was logged: the caller hung up or the "
+            "line dropped. "
+            + (f"Please call them back on {number}." if number else "Their number was withheld, so check "
+               "the transcript for any contact details.")
+            + f"\n\nWhat the caller said:\n{heard}"
+        ),
+        affected_users="Unknown",
+        category="other",
+        priority="P3",
+        caller_id=number or None,
+        transcript=messages,
+    )
+    try:
+        helpdesk = psa.get(cfg)
+        if helpdesk:
+            # Only the caller ID can identify them here; the name they said isn't known to the code.
+            ticket.contact, ticket.company_id = (match, match.company_id) if match else await psa.resolve_contact(
+                helpdesk, call.psa_match, "", "")
+        store = get_ticket_store(cfg)
+        ref = await store.create(ticket)
+        logger.info(f"Call dropped without a ticket; logged callback ticket {ref}")
+        note(f"📵 Call ended without a ticket, so callback ticket {ref} was logged")
+        if store.last_error:
+            note(f"⚠️ It couldn't be created in {helpdesk.name}, so it's saved on the server only: {store.last_error}")
+    except Exception:
+        logger.exception("Couldn't log a ticket for the dropped call")
+        note("⚠️ Couldn't log a ticket for the dropped call")
+
+
 def _tools(
     call: CallInfo, call_id: str, speech: SpeechTracker, ami: AMIClient, cfg: dict[str, str],
     taps: list[TranscriptTap],
@@ -848,6 +936,7 @@ def _tools(
         bus.publish({"type": "note", "call_id": call_id, "text": text})
 
     tickets = get_ticket_store(cfg)
+    helpdesk = psa.get(cfg)
     transfer_target = cfg["TRANSFER_TARGET"]
 
     async def create_ticket(params: FunctionCallParams) -> None:
@@ -871,7 +960,12 @@ def _tools(
             caller_id=call.caller_number or None,
             transcript=identity.redact_transcript(list(params.context.get_messages()), call.reset.redact),
         )
+        if helpdesk:
+            await link_contact(call, helpdesk, ticket, note)
         call.ticket_id = await tickets.create(ticket)
+        if tickets.last_error:
+            note(f"⚠️ Couldn't create the ticket in {helpdesk.name}, so it's saved on the server only: "
+                 f"{tickets.last_error}")
         call.ticket_priority = ticket.priority
         logger.info(f"Created ticket {call.ticket_id} ({ticket.priority}) for {ticket.organisation}")
         note(f"🎫 Ticket {call.ticket_id} created: {ticket.priority}, {ticket.summary}")
@@ -943,6 +1037,7 @@ def _tools(
         await params.result_callback("Transferred.", properties=FunctionCallResultProperties(run_llm=False))
 
     async def end_call(params: FunctionCallParams) -> None:
+        call.ended_by_agent = True
         note("Agent ended the call")
         await params.result_callback(None, properties=FunctionCallResultProperties(run_llm=False))
         # Flushes queued audio (the goodbye) before the pipeline stops and Asterisk hangs up.
@@ -1035,6 +1130,16 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
         bus.publish({"type": "call_end", "call_id": call_id})
         return
 
+    if cfg["PSA_PROVIDER"] != "none" and (missing_psa := psa.missing(cfg)):
+        labels = ", ".join(settings.FIELDS_BY_KEY[k].label for k in missing_psa)
+        logger.warning(f"PSA is selected but not set up: missing {labels}")
+        bus.publish({"type": "note", "call_id": call_id,
+                     "text": f"⚠️ Tickets won't go to the PSA on this call: missing {labels}"})
+    helpdesk = psa.get(cfg)
+    if helpdesk and cfg["PSA_CALLER_LOOKUP"] == "yes" and call.caller_number:
+        # Runs while the call is being set up; waited for (briefly) before the agent starts.
+        call.psa_lookup = asyncio.create_task(psa.lookup_caller(helpdesk, call.caller_number))
+
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
@@ -1055,6 +1160,18 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
         if call.caller_number
         else ""
     )
+    if call.psa_lookup:
+        try:
+            call.psa_match = await asyncio.wait_for(asyncio.shield(call.psa_lookup), 3)
+        except asyncio.TimeoutError:
+            logger.warning("PSA caller lookup is slow; answering without it")
+        if isinstance(call.psa_match, psa.Contact):
+            bus.publish({"type": "note", "call_id": call_id, "text": f"👤 Caller ID matches "
+                         f"{call.psa_match.name} ({call.psa_match.company_name})"})
+        elif call.psa_match:
+            bus.publish({"type": "note", "call_id": call_id,
+                         "text": f"👥 Caller ID matches {len(call.psa_match)} contacts"})
+        caller_ctx += psa.caller_hint(call.psa_match)
     resets_on = cfg["PASSWORD_RESET_ENABLED"] == "yes"
     if resets_on and (missing_reset := reset_configured(cfg)):
         resets_on = False
@@ -1203,6 +1320,13 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
         await runner.run()
     finally:
         await http.close()
+        dropped = not (call.ticket_started or call.transfer_started or call.ended_by_agent)
+        mode = cfg["DROPPED_CALL_TICKETS"]
+        if dropped and (mode == "always" or (mode == "spoke" and caller_turns > 0)):
+            # Detached, so it still finishes if this handler is cancelled as the WebSocket closes.
+            task = asyncio.create_task(log_dropped_call(call, call_id, cfg, list(context.get_messages())))
+            _background.add(task)
+            task.add_done_callback(_background.discard)
         bus.publish({"type": "call_end", "call_id": call_id})
         if recorder:
             await recorder.save()

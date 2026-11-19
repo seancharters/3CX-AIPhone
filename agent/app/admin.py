@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from loguru import logger
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import identity, settings
+from . import identity, psa, settings
 from .asterisk import AMIClient
 from .triage import tickets
 
@@ -126,14 +126,14 @@ async def test_email(request: Request):
     missing = [settings.FIELDS_BY_KEY[k].label for k in ("EMAIL_TO", "EMAIL_FROM", "SMTP_HOST") if not cfg[k]]
     if missing:
         request.session["flash"] = ("error", f"Saved, but can't send a test yet. Fill in: {', '.join(missing)}.")
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/#tickets", status_code=303)
     try:
         await asyncio.to_thread(tickets.send_email, cfg, tickets.test_email(cfg))
         request.session["flash"] = ("ok", f"Saved, and a test email was sent to {cfg['EMAIL_TO']}. Check the inbox (and junk).")
     except Exception as e:
         logger.warning(f"Test email failed: {e!r}")
         request.session["flash"] = ("error", f"Saved, but the test email failed: {type(e).__name__}: {e}")
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/#tickets", status_code=303)
 
 
 @app.post("/test-entra", response_class=HTMLResponse)
@@ -147,7 +147,7 @@ async def test_entra(request: Request):
                if not cfg[k]]
     if missing:
         request.session["flash"] = ("error", f"Saved, but can't test Entra yet. Fill in: {', '.join(missing)}.")
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/#resets", status_code=303)
     try:
         request.session["flash"] = ("ok", "Saved. " + await identity.test_connection(cfg))
     except identity.IdentityError as err:
@@ -155,7 +155,7 @@ async def test_entra(request: Request):
     except Exception as err:
         logger.warning(f"Entra test failed: {err!r}")
         request.session["flash"] = ("error", f"Saved, but the Entra test failed: {type(err).__name__}: {err}")
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/#resets", status_code=303)
 
 
 @app.post("/test-sms", response_class=HTMLResponse)
@@ -170,7 +170,7 @@ async def test_sms(request: Request):
     if not cfg["SMTP2GO_API_KEY"] or not number:
         request.session["flash"] = ("error", "Saved, but can't send a test SMS: enter the SMTP2GO API key and a "
                                     "mobile number to send it to.")
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/#resets", status_code=303)
     try:
         await identity.send_sms(cfg, number, "Test message from the IT support phone agent. SMS verification "
                                 "codes will arrive like this.")
@@ -178,7 +178,34 @@ async def test_sms(request: Request):
     except Exception as err:
         logger.warning(f"Test SMS failed: {err!r}")
         request.session["flash"] = ("error", f"Saved, but the test SMS failed: {err}")
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/#resets", status_code=303)
+
+
+@app.post("/test-psa", response_class=HTMLResponse)
+async def test_psa(request: Request):
+    if not request.session.get("admin"):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    _, cfg, error = _apply_form(form)
+    if error:
+        return _page("Settings", _settings_form(cfg, ("error", error)), nav=True)
+    if cfg["PSA_PROVIDER"] == "none":
+        request.session["flash"] = ("error", "Saved. Choose ConnectWise or HaloPSA to test the connection.")
+        return RedirectResponse("/#tickets", status_code=303)
+    if missing := psa.missing(cfg):
+        labels = ", ".join(settings.FIELDS_BY_KEY[k].label for k in missing)
+        request.session["flash"] = ("error", f"Saved, but can't test yet. Fill in: {labels}.")
+        return RedirectResponse("/#tickets", status_code=303)
+    helpdesk = psa.get(cfg)
+    try:
+        result = await helpdesk.test(str(form.get("test_psa_number", "")).strip())
+        request.session["flash"] = ("ok", "Saved. " + result)
+    except psa.PSAError as err:
+        request.session["flash"] = ("error", f"Saved, but the {helpdesk.name} test failed: {err}")
+    except Exception as err:
+        logger.warning(f"PSA test failed: {err!r}")
+        request.session["flash"] = ("error", f"Saved, but the {helpdesk.name} test failed: {type(err).__name__}: {err}")
+    return RedirectResponse("/#tickets", status_code=303)
 
 
 @app.get("/backup")
@@ -211,13 +238,13 @@ async def restore(request: Request, file: UploadFile):
             raise ValueError
     except (ValueError, KeyError, UnicodeDecodeError):
         request.session["flash"] = ("error", "That isn't a backup from this admin page. Nothing was changed.")
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/#backup", status_code=303)
     try:
         # Anything missing from the backup goes back to its default.
         settings.save({f.key: str(backed_up.get(f.key) or "") for f in settings.FIELDS})
     except settings.ValidationError as err:
         request.session["flash"] = ("error", f"Couldn't restore, nothing was changed. {err}")
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/#backup", status_code=303)
     ignored = sorted(set(backed_up) - set(settings.FIELDS_BY_KEY))
     logger.info(f"Settings restored from backup made {data.get('created', 'at an unknown time')}")
     request.session["flash"] = (
@@ -226,7 +253,7 @@ async def restore(request: Request, file: UploadFile):
         "call, and Asterisk re-registers with 3CX within a few seconds."
         + (f" Ignored settings this version doesn't have: {', '.join(ignored)}." if ignored else ""),
     )
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/#backup", status_code=303)
 
 
 @app.get("/status")
@@ -322,46 +349,98 @@ async def logout(request: Request):
 e = html.escape
 
 
+# Settings are grouped into tabs. Every section in settings.FIELDS must be on exactly one tab.
+TABS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("general", "General", ("Agent",)),
+    ("voice", "Voice and AI", ("Providers", "Azure", "Anthropic", "Deepgram", "ElevenLabs")),
+    ("prompt", "System prompt", ("System prompt",)),
+    ("phone", "Phone system", ("3CX extension", "Server")),
+    ("tickets", "Tickets", ("Helpdesk (PSA)", "Dropped calls", "Email tickets")),
+    ("resets", "Password resets", ("Password resets",)),
+    ("backup", "Backup", ()),
+)
+assert sorted(s for _, _, ss in TABS for s in ss) == sorted({f.section for f in settings.FIELDS})
+
+
+def _show_if_attr(key: str, values: dict[str, str], allowed: tuple[str, ...]) -> str:
+    rule = e(json.dumps({key: list(allowed)}))
+    return f" data-show-if='{rule}'" + ("" if values.get(key) in allowed else " hidden")
+
+
+def _section_extras(section: str, values: dict[str, str]) -> str:
+    """Test buttons and other extras at the bottom of a section."""
+    if section == "Email tickets":
+        return (f'<div class="actions"{_show_if_attr("TICKET_EMAIL_ENABLED", values, ("yes",))}>'
+                '<button type="submit" formaction="/test-email" class="secondary">Save and send test email</button></div>')
+    if section == "Helpdesk (PSA)":
+        on = ("connectwise", "halopsa")
+        return (
+            f'<div class="field"{_show_if_attr("PSA_PROVIDER", values, on)}><label for="test_psa_number">'
+            'Look up a test number</label><input id="test_psa_number" name="test_psa_number" '
+            'placeholder="Optional, e.g. 0412 345 678"><small>Not saved. The test shows which contact this '
+            "number matches, the way a caller ID would be matched</small></div>"
+            f'<div class="actions"{_show_if_attr("PSA_PROVIDER", values, on)}>'
+            '<button type="submit" formaction="/test-psa" class="secondary">Save and test connection</button></div>'
+        )
+    if section == "Password resets":
+        on = ("yes",)
+        return (
+            f'<div class="field"{_show_if_attr("PASSWORD_RESET_ENABLED", values, on)}>'
+            '<label for="test_sms_to">Send a test SMS to</label>'
+            '<input id="test_sms_to" name="test_sms_to" placeholder="e.g. 0412 345 678">'
+            "<small>Not saved. Only used by the test SMS button</small></div>"
+            f'<div class="actions gap"{_show_if_attr("PASSWORD_RESET_ENABLED", values, on)}>'
+            '<button type="submit" formaction="/test-sms" class="secondary">Save and send test SMS</button>'
+            '<button type="submit" formaction="/test-entra" class="secondary">Save and test Entra</button></div>'
+        )
+    return ""
+
+
+def _error_tab(message: str) -> str:
+    """The tab holding the first setting named in a validation error, so it opens there."""
+    for tab_id, _, sections in TABS:
+        for f in settings.FIELDS:
+            if f.section in sections and f"{f.label}:" in message:
+                return tab_id
+    return ""
+
+
 def _settings_form(values: dict[str, str], flash: tuple[str, str] | None) -> str:
-    parts = []
+    by_section: dict[str, list[settings.Field]] = {}
+    for f in settings.FIELDS:
+        by_section.setdefault(f.section, []).append(f)
+
+    nav = "".join(f'<a href="#{tid}" data-tab="{tid}">{e(label)}</a>' for tid, label, _ in TABS)
+    parts = [
+        '<div class="layout"><aside class="sidenav">'
+        '<div class="status"><span id="dot" class="dot"></span><div><strong id="state">Checking…</strong>'
+        '<small id="detail"></small></div></div>'
+        f'<nav class="tabs">{nav}</nav></aside><div class="content">'
+    ]
     if flash:
-        parts.append(f'<p class="flash {e(flash[0])}">{e(flash[1])}</p>')
-    parts.append(
-        '<section class="card status"><h2>3CX registration</h2>'
-        '<p><span id="dot" class="dot"></span><strong id="state">Checking…</strong> '
-        '<span id="detail" class="muted"></span></p></section>'
-    )
-    parts.append('<form method="post" autocomplete="off">')
-    for section, group in groupby(settings.FIELDS, key=lambda f: f.section):
-        fields = list(group)
-        hidden = "" if any(settings.visible(f, values) for f in fields) else " hidden"
-        parts.append(f'<section class="card{hidden}"><h2>{e(section)}</h2>')
-        for f in fields:
-            parts.append(_field(f, values[f.key], settings.visible(f, values)))
-        if section == "Email tickets":
-            parts.append(
-                '<div class="actions" data-show-if=\'{"TICKET_EMAIL_ENABLED": ["yes"]}\''
-                + ("" if values.get("TICKET_EMAIL_ENABLED") == "yes" else ' hidden')
-                + '><button type="submit" formaction="/test-email" class="secondary">'
-                "Save and send test email</button></div>"
-            )
-        if section == "Password resets":
-            parts.append(
-                '<div class="field" data-show-if=\'{"PASSWORD_RESET_ENABLED": ["yes"]}\''
-                + ("" if values.get("PASSWORD_RESET_ENABLED") == "yes" else ' hidden')
-                + '><label for="test_sms_to">Send a test SMS to</label>'
-                '<input id="test_sms_to" name="test_sms_to" placeholder="e.g. 0412 345 678">'
-                "<small>Not saved. Only used by the test SMS button</small></div>"
-                '<div class="actions gap" data-show-if=\'{"PASSWORD_RESET_ENABLED": ["yes"]}\''
-                + ("" if values.get("PASSWORD_RESET_ENABLED") == "yes" else ' hidden')
-                + '><button type="submit" formaction="/test-sms" class="secondary">Save and send test SMS</button>'
-                '<button type="submit" formaction="/test-entra" class="secondary">Save and test Entra</button></div>'
-            )
-        parts.append("</section>")
-    parts.append('<div class="actions"><button type="submit">Save settings</button></div></form>')
-    parts.append(_BACKUP_CARD)
+        error_tab = _error_tab(flash[1]) if flash[0] == "error" else ""
+        parts.append(f'<p class="flash {e(flash[0])}" data-tab-hint="{error_tab}">{e(flash[1])}</p>')
+    parts.append('<form method="post" autocomplete="off" id="settings">')
+    for tab_id, label, sections in TABS:
+        if not sections:
+            continue
+        parts.append(f'<div class="page" data-page="{tab_id}"><h2 class="page-title">{e(label)}</h2>')
+        for section in sections:
+            fields = by_section[section]
+            hidden = "" if any(settings.visible(f, values) for f in fields) else " hidden"
+            title = f"<h3>{e(section)}</h3>" if len(sections) > 1 else ""
+            parts.append(f'<section class="card{hidden}">{title}')
+            parts.extend(_field(f, values[f.key], settings.visible(f, values)) for f in fields)
+            parts.append(_section_extras(section, values))
+            parts.append("</section>")
+        parts.append("</div>")
+    parts.append('<div class="savebar"><span id="dirty" class="muted"></span>'
+                 '<button type="submit">Save settings</button></div></form>')
+    parts.append(f'<div class="page" data-page="backup"><h2 class="page-title">Backup</h2>{_BACKUP_CARD}</div>')
+    parts.append("</div></div>")
     parts.append(_STATUS_SCRIPT)
     parts.append(_VISIBILITY_SCRIPT)
+    parts.append(_TABS_SCRIPT)
     return "".join(parts)
 
 
@@ -435,7 +514,7 @@ def _page(title: str, body: str, nav: bool = False, wide: bool = False) -> HTMLR
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>IT Triage Agent</title><style>{_CSS}</style></head>
 <body><header><h1>IT Triage Agent <span>{e(title)}</span></h1>{logout}</header>
-<main{' class="wide"' if wide else ""}>{body}</main></body></html>""",
+<main{' class="wide"' if wide else ' class="settings"' if title == "Settings" else ""}>{body}</main></body></html>""",
         headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"},
     )
 
@@ -496,7 +575,7 @@ function connect() {
 connect();
 </script>"""
 
-_BACKUP_CARD = """<section class="card"><h2>Backup and restore</h2>
+_BACKUP_CARD = """<section class="card">
 <p>Download every setting, including API keys, passwords and the system prompt, as a file. Restore it
 here, or on a new server, to put everything back. The admin password and tickets aren't included.</p>
 <p class="flash error">The backup contains your API keys and 3CX password in plain text. Store it
@@ -522,6 +601,33 @@ function applyVisibility() {
 }
 document.querySelectorAll('select').forEach(s => s.addEventListener('change', applyVisibility));
 applyVisibility();
+</script>"""
+
+_TABS_SCRIPT = """<script>
+// One form, shown a tab at a time. Hidden tabs are still saved with the form.
+const pages = document.querySelectorAll('.page');
+const links = document.querySelectorAll('.tabs a');
+const savebar = document.querySelector('.savebar');
+function showTab(id) {
+  if (![...pages].some(p => p.dataset.page === id)) id = 'general';
+  pages.forEach(p => { p.hidden = p.dataset.page !== id; });
+  links.forEach(a => a.classList.toggle('active', a.dataset.tab === id));
+  savebar.hidden = id === 'backup';
+  try { sessionStorage.setItem('tab', id); } catch (e) {}
+  history.replaceState(null, '', '#' + id);
+}
+links.forEach(a => a.addEventListener('click', ev => { ev.preventDefault(); showTab(a.dataset.tab); window.scrollTo(0, 0); }));
+let start = location.hash.slice(1);
+const hint = document.querySelector('[data-tab-hint]');
+if (hint && hint.dataset.tabHint) start = hint.dataset.tabHint;
+if (!start) { try { start = sessionStorage.getItem('tab') || ''; } catch (e) {} }
+showTab(start || 'general');
+// Remind people to save before they wander off.
+const form = document.getElementById('settings');
+let dirty = false;
+form.addEventListener('input', () => { dirty = true; document.getElementById('dirty').textContent = 'Unsaved changes'; });
+form.addEventListener('submit', () => { dirty = false; });
+window.addEventListener('beforeunload', ev => { if (dirty) { ev.preventDefault(); ev.returnValue = ''; } });
 </script>"""
 
 _STATUS_SCRIPT = """<script>
@@ -586,6 +692,30 @@ main.wide { max-width:860px; }
 .line.partial .text { opacity:.6; font-style:italic; }
 .note { margin:4px 0 10px 62px; font-size:13px; color:var(--muted); }
 .status p { margin:0; }
+/* Settings: tabs down the side, one tab's settings at a time */
+main.settings { max-width:1040px; }
+.layout { display:grid; grid-template-columns:220px minmax(0, 1fr); gap:28px; align-items:start; }
+.sidenav { position:sticky; top:16px; }
+.sidenav .status { display:flex; gap:2px; align-items:flex-start; background:var(--card); border:1px solid var(--border);
+         border-radius:10px; padding:12px; margin-bottom:12px; font-size:14px; }
+.sidenav .status .dot { margin-top:6px; flex:0 0 10px; }
+.sidenav .status small { margin-top:2px; font-size:12px; line-height:1.4; }
+.tabs { display:flex; flex-direction:column; gap:2px; }
+.tabs a { color:var(--muted); text-decoration:none; padding:8px 12px; border-radius:7px; }
+.tabs a:hover { background:var(--card); color:var(--text); }
+.tabs a.active { background:var(--card); color:var(--text); font-weight:600; box-shadow:inset 3px 0 0 var(--accent); }
+.page-title { font-size:20px; text-transform:none; letter-spacing:0; color:var(--text); margin:0 0 14px; }
+h3 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 12px; }
+.content > .flash { margin-top:0; }
+.savebar { position:sticky; bottom:0; display:flex; justify-content:flex-end; align-items:center; gap:14px;
+         padding:12px 0 16px; background:linear-gradient(transparent, var(--bg) 30%); }
+@media (max-width: 760px) {
+  .layout { grid-template-columns:minmax(0, 1fr); gap:12px; }
+  .sidenav { position:static; }
+  .tabs { flex-direction:row; overflow-x:auto; gap:4px; padding-bottom:4px; }
+  .tabs a { white-space:nowrap; padding:7px 10px; }
+  .tabs a.active { box-shadow:inset 0 -2px 0 var(--accent); }
+}
 [hidden] { display:none !important; } .dot { display:inline-block; width:10px; height:10px; border-radius:50%;
          background:var(--muted); margin-right:8px; } .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
 """
