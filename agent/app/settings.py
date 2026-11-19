@@ -119,11 +119,16 @@ FIELDS: tuple[Field, ...] = (
     Field("AZURE_OPENAI_DEPLOYMENT", "Azure OpenAI deployment name", "Azure",
           "The name you gave the model deployment, e.g. gpt-4.1. Fast, non-reasoning models suit phone calls",
           validate=_pattern(r"[A-Za-z0-9._-]+", "Letters, numbers and . _ - only")),
+    Field("AZURE_OPENAI_API", "Azure OpenAI API", "Azure",
+          "Responses is needed for newer models such as gpt-6.x, which only allow tools (tickets, transfers) "
+          "with reasoning on the Responses API. Chat Completions suits gpt-4.1 and gpt-5.x",
+          default="chat", choices=("chat", "responses"), labels=("Chat Completions", "Responses")),
     Field("AZURE_OPENAI_REASONING", "Reasoning effort", "Azure",
-          "For reasoning models (gpt-5.x). None is fastest and Microsoft's recommendation for voice. "
-          "Choose \"Don't send\" for non-reasoning models like gpt-4.1",
-          default="none", choices=("none", "low", "medium", "omit"),
-          labels=("None (fastest, recommended)", "Low", "Medium", "Don't send (gpt-4.1 etc.)")),
+          "For reasoning models (gpt-5.x and later). None is fastest and Microsoft's recommendation for voice, "
+          "but some models (e.g. gpt-6.1-sol) don't allow it: use Low. Choose \"Don't send\" for "
+          "non-reasoning models like gpt-4.1",
+          default="none", choices=("none", "minimal", "low", "medium", "omit"),
+          labels=("None (fastest, recommended)", "Minimal", "Low", "Medium", "Don't send (gpt-4.1 etc.)")),
     Field("AZURE_WHISPER_ENDPOINT", "gpt-realtime-whisper endpoint", "Azure",
           "Only if gpt-realtime-whisper is selected above. Leave empty if it's the same resource as Azure OpenAI",
           validate=_https_url),
@@ -346,6 +351,7 @@ SHOW_IF: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "AZURE_OPENAI_API_KEY": ((LLM, ("azure_openai",)), (STT, ("azure_whisper",))),
     "AZURE_OPENAI_DEPLOYMENT": ((LLM, ("azure_openai",)),),
     "AZURE_OPENAI_REASONING": ((LLM, ("azure_openai",)),),
+    "AZURE_OPENAI_API": ((LLM, ("azure_openai",)),),
     "AZURE_WHISPER_ENDPOINT": ((STT, ("azure_whisper",)),),
     "AZURE_WHISPER_API_KEY": ((STT, ("azure_whisper",)),),
     "AZURE_WHISPER_DEPLOYMENT": ((STT, ("azure_whisper",)),),

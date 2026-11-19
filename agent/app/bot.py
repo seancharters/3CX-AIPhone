@@ -40,6 +40,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.azure.llm import AzureLLMService
+from pipecat.services.openai.responses.llm import OpenAIResponsesHttpLLMService, OpenAIResponsesReasoningConfig
 from pipecat.services.azure.stt import AzureSTTService
 import azure.cognitiveservices.speech as speechsdk
 from pipecat.services.azure.tts import AzureTTSService
@@ -424,6 +425,19 @@ def _tts(cfg: dict[str, str], call_id: str, http: aiohttp.ClientSession) -> TTSS
 
 
 def _llm(cfg: dict[str, str], system_prompt: str) -> LLMService:
+    if cfg["LLM_PROVIDER"] == "azure_openai" and cfg["AZURE_OPENAI_API"] == "responses":
+        # Newer models (e.g. gpt-6.x) only allow function tools with reasoning on the Responses API.
+        effort = cfg["AZURE_OPENAI_REASONING"]
+        return OpenAIResponsesHttpLLMService(
+            api_key=cfg["AZURE_OPENAI_API_KEY"],
+            base_url=f"https://{_azure_host(cfg['AZURE_OPENAI_ENDPOINT'])}/openai/v1",
+            settings=OpenAIResponsesHttpLLMService.Settings(
+                model=cfg["AZURE_OPENAI_DEPLOYMENT"],
+                system_instruction=system_prompt,
+                # "Don't send" leaves it to pipecat, which turns reasoning off where the model allows.
+                reasoning=None if effort == "omit" else OpenAIResponsesReasoningConfig(effort=effort),
+            ),
+        )
     if cfg["LLM_PROVIDER"] == "azure_openai":
         return AzureLLMService(
             api_key=cfg["AZURE_OPENAI_API_KEY"],
