@@ -96,6 +96,33 @@ your 3CX **Digital Receptionist** (e.g. "press 1 for IT support") that goes to e
 - **Tickets:** `docker compose exec agent ls tickets`, or copy them out with
   `docker compose cp agent:/srv/tickets ./tickets`
 
+## If running a reverse proxy
+
+You can serve the admin page through a reverse proxy, such as NGINX Proxy Manager, instead of the
+SSH tunnel. The page holds your API keys, so use HTTPS, and limit who can reach it (for example,
+with an access list).
+
+Point the proxy at the admin page on port `8000`. `docker-compose.yml` publishes it on
+`127.0.0.1` only, so a proxy on another machine, or in a container that can't reach the host's
+localhost, needs that port mapping changed.
+
+The **Live calls** tab streams events over one long-lived connection to `/live/stream`. nginx
+buffers proxied responses by default, so the page loads but never updates. Turn buffering off for
+that path. In NGINX Proxy Manager, edit the proxy host and add this on the **Advanced** tab,
+replacing `<admin-host>` with the host the proxy already forwards to:
+
+```nginx
+location /live/stream {
+    proxy_pass http://<admin-host>:8000;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 1h;
+}
+```
+
+The app also sends `X-Accel-Buffering: no` on this stream, which is enough for some nginx setups,
+but not all. Other proxies need their equivalent of turning off response buffering for that path.
+
 ## Testing without 3CX (optional)
 
 Set a **Test softphone password** in the admin page. Then register a softphone (e.g. Zoiper or Linphone)
