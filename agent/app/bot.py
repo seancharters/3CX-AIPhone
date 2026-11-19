@@ -189,11 +189,14 @@ MAX_NUDGES = 2
 
 
 def _claims(pattern: re.Pattern, text: str) -> bool:
-    """True if a statement (not a question, a "before..." or a "can't") matches `pattern`."""
+    """True if a statement (not a question, an offer, a "before..." or a "can't") matches `pattern`.
+    Offers ("would you like me to log a ticket", "I can log a ticket, but I'll need...") are skipped
+    even without a "?", because a reply cut off by the caller loses its question mark."""
     for sentence in re.split(r"(?<=[.!?])\s+", text):
         if sentence.rstrip().endswith("?") or re.search(
             r"\b(before|can't|cannot|can not|couldn't|could not|unable|not able|wasn't able|"
-            r"didn't|if you)\b", sentence, re.IGNORECASE
+            r"didn't|if you|would you like|do you want|want me to|shall I|should I|I can|"
+            r"happy to|I'll need|I need)\b", sentence, re.IGNORECASE
         ):
             continue
         if pattern.search(sentence):
@@ -1300,10 +1303,13 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
     async def nudge(kind: str):
         turns_before = caller_turns
         await asyncio.sleep(1.5)  # the same reply may still be calling the tool
-        if kind == "stall":
-            done = caller_turns != turns_before  # the caller spoke; let the model answer them instead
-        else:
-            done = call.ticket_started if kind == "ticket" else call.transfer_started
+        # If the caller spoke since, the model is already answering them (and may be calling the tool
+        # right now); a nudge on top of that makes it reply twice.
+        done = caller_turns != turns_before
+        if kind == "ticket":
+            done = done or call.ticket_started
+        elif kind in ("transfer", "p1"):
+            done = done or call.transfer_started
         if done or nudges.get(kind, 0) >= MAX_NUDGES:
             return
         nudges[kind] = nudges.get(kind, 0) + 1
