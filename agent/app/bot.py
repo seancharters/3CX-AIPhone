@@ -7,6 +7,7 @@ as chosen in the admin UI.
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
 import time
 from dataclasses import dataclass, field
@@ -223,6 +224,12 @@ class SpeechTracker(FrameProcessor):
         super().__init__()
         self._started = asyncio.Event()
         self._stopped = asyncio.Event()
+        self._saying = 0  # say_and_wait calls in progress (their audio may not have started yet)
+
+    @property
+    def busy(self) -> bool:
+        """The agent is speaking, or a tool has queued something to say."""
+        return self._started.is_set() or self._saying > 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -235,13 +242,45 @@ class SpeechTracker(FrameProcessor):
         await self.push_frame(frame, direction)
 
     async def say_and_wait(self, llm: LLMService, text: str, append_to_context: bool = True) -> None:
-        self._started.clear()
-        await llm.push_frame(TTSSpeakFrame(text, append_to_context=append_to_context))
+        self._saying += 1
         try:
-            await asyncio.wait_for(self._started.wait(), timeout=5)
-            await asyncio.wait_for(self._stopped.wait(), timeout=20)
-        except TimeoutError:
-            logger.warning("Timed out waiting for speech to finish")
+            self._started.clear()
+            await llm.push_frame(TTSSpeakFrame(text, append_to_context=append_to_context))
+            try:
+                await asyncio.wait_for(self._started.wait(), timeout=5)
+                await asyncio.wait_for(self._stopped.wait(), timeout=20)
+            except TimeoutError:
+                logger.warning("Timed out waiting for speech to finish")
+        finally:
+            self._saying -= 1
+
+
+# How long the line can be silent while a tool runs before the agent says it's working on it.
+FILLER_AFTER_SECS = 1.5
+
+
+def with_filler(handler, speech: SpeechTracker, text: str):
+    """Wraps a slow tool so the caller hears `text` (e.g. "Just a moment while I log that for you")
+    if the line has been silent for FILLER_AFTER_SECS while it runs, instead of dead air. Silence is
+    counted only once the agent stops talking, so it doesn't talk over a reply or tool's own speech,
+    and quick tools say nothing."""
+
+    async def filler(llm: LLMService) -> None:
+        silent = 0.0
+        while silent < FILLER_AFTER_SECS:
+            await asyncio.sleep(0.1)
+            silent = 0.0 if speech.busy else silent + 0.1
+        await llm.push_frame(TTSSpeakFrame(text, append_to_context=False))
+
+    @functools.wraps(handler)  # keeps @tool_options settings
+    async def wrapped(params: FunctionCallParams) -> None:
+        task = asyncio.create_task(filler(params.llm))
+        try:
+            await handler(params)
+        finally:
+            task.cancel()
+
+    return wrapped
 
 
 class ReplyWatcher(FrameProcessor):
@@ -822,7 +861,7 @@ def _reset_tools(
                 "type": "string",
                 "description": "The caller's work email address (preferred), or their full name"}},
             required=["email_or_name"],
-            handler=find_user_account,
+            handler=with_filler(find_user_account, speech, "Just a moment while I look up your account."),
         ),
         FunctionSchema(
             name="verify_employee_id",
@@ -830,7 +869,7 @@ def _reset_tools(
             properties={"employee_id": {
                 "type": "string", "description": "Exactly what the caller said, as digits/letters, no spaces"}},
             required=["employee_id"],
-            handler=verify_employee_id,
+            handler=with_filler(verify_employee_id, speech, "Just a moment while I check that."),
         ),
         FunctionSchema(
             name="send_verification_code",
@@ -838,14 +877,14 @@ def _reset_tools(
                         "number: it only ever goes to the number on the account.",
             properties={},
             required=[],
-            handler=send_verification_code,
+            handler=with_filler(send_verification_code, speech, "Just a moment while I send that code."),
         ),
         FunctionSchema(
             name="verify_sms_code",
             description="Check the code the caller read out from the text message.",
             properties={"code": {"type": "string", "description": "The six digits the caller read out"}},
             required=["code"],
-            handler=verify_sms_code,
+            handler=with_filler(verify_sms_code, speech, "Just a moment while I check that code."),
         ),
         FunctionSchema(
             name="reset_password",
@@ -856,7 +895,7 @@ def _reset_tools(
                 "type": "string", "enum": ["read_out", "sms"],
                 "description": "How the caller chose to receive the temporary password"}},
             required=["delivery"],
-            handler=reset_password,
+            handler=with_filler(reset_password, speech, "Just a moment while I reset your password."),
         ),
         FunctionSchema(
             name="repeat_temporary_password",
@@ -1118,7 +1157,7 @@ def _tools(
             },
             required=["caller_name", "organisation", "callback_phone", "email", "summary",
                       "description", "affected_users", "category", "priority"],
-            handler=create_ticket,
+            handler=with_filler(create_ticket, speech, "Just a moment while I log that for you."),
         ),
         FunctionSchema(
             name="transfer_to_human",
