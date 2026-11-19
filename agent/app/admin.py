@@ -302,7 +302,10 @@ async def live_stream(request: Request):
         except httpx.HTTPError as err:
             yield f"data: {json.dumps({'type': 'error', 'text': f'Can’t reach the agent: {err}'})}\n\n".encode()
 
-    return StreamingResponse(relay(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+    # X-Accel-Buffering stops nginx-based reverse proxies (e.g. NGINX Proxy Manager) holding the stream
+    # in their buffer; no-transform stops proxies compressing it, which also delays events.
+    headers = {"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"}
+    return StreamingResponse(relay(), media_type="text/event-stream", headers=headers)
 
 
 @app.get("/setup", response_class=HTMLResponse)
