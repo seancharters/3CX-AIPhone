@@ -156,6 +156,10 @@ class CallInfo:
     psa_match: psa.Contact | list[psa.Contact] | None = None
     psa_lookup: asyncio.Task | None = None  # still running if it was slow when the call was answered
     ended_by_agent: bool = False  # end_call was used, so the call didn't just drop
+    # What the LLM said in its latest reply, and set once ReplyWatcher has seen all of that reply's
+    # text (when it reaches the reply's tool calls), so a tool can check what was said alongside it.
+    reply_text: str = ""
+    reply_text_done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # The agent claiming a ticket is being created / exists, e.g. "I'll create a ticket for you",
@@ -242,9 +246,10 @@ class ReplyWatcher(FrameProcessor):
     something ("I'll send a code... One moment please") but the reply made no tool call, which
     would otherwise leave the caller in silence."""
 
-    def __init__(self, on_stall) -> None:
+    def __init__(self, on_stall, call: CallInfo) -> None:
         super().__init__()
         self._on_stall = on_stall
+        self._call = call
         self._text: list[str] = []
         self._called_tool = False
 
@@ -252,10 +257,14 @@ class ReplyWatcher(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, LLMFullResponseStartFrame):
             self._text, self._called_tool = [], False
+            self._call.reply_text = ""
+            self._call.reply_text_done.clear()
         elif isinstance(frame, LLMTextFrame):
             self._text.append(frame.text)
         elif isinstance(frame, FunctionCallsStartedFrame):
             self._called_tool = True
+            self._call.reply_text = "".join(self._text)
+            self._call.reply_text_done.set()
         elif isinstance(frame, LLMFullResponseEndFrame):
             text = "".join(self._text)
             if not self._called_tool and claims_stall(text):
@@ -877,6 +886,12 @@ async def link_contact(call: CallInfo, helpdesk: psa.PSA, ticket: Ticket, note) 
         note(f"❔ Caller not found in {helpdesk.name}; logging against the unknown-caller company")
 
 
+def _transcript(context: LLMContext) -> list[dict]:
+    """The call's messages as plain dicts. With the Responses API the context also holds the model's
+    reasoning records (LLMSpecificMessage objects), which aren't part of the conversation."""
+    return [m for m in context.get_messages() if isinstance(m, dict)]
+
+
 def _caller_lines(messages: list[dict]) -> list[str]:
     lines = []
     for m in messages:
@@ -972,7 +987,7 @@ def _tools(
             category=args["category"],
             priority=args["priority"],
             caller_id=call.caller_number or None,
-            transcript=identity.redact_transcript(list(params.context.get_messages()), call.reset.redact),
+            transcript=identity.redact_transcript(_transcript(params.context), call.reset.redact),
         )
         if helpdesk:
             await link_contact(call, helpdesk, ticket, note)
@@ -1054,6 +1069,14 @@ def _tools(
         call.ended_by_agent = True
         note("Agent ended the call")
         await params.result_callback(None, properties=FunctionCallResultProperties(run_llm=False))
+        # Some models call end_call without saying anything, which hangs up on the caller mid-thanks.
+        try:
+            await asyncio.wait_for(call.reply_text_done.wait(), timeout=1)
+        except TimeoutError:
+            pass
+        if not call.reply_text.strip():
+            logger.info("end_call with no goodbye; saying one")
+            await params.llm.push_frame(TTSSpeakFrame("Thanks for calling. Goodbye."))
         # Flushes queued audio (the goodbye) before the pipeline stops and Asterisk hangs up.
         await params.llm.push_frame(EndWorkerFrame())
 
@@ -1210,7 +1233,7 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
         if not claims_ticket(text) and not claims_transfer(text):  # those have their own nudges
             asyncio.create_task(nudge("stall"))
 
-    reply_watcher = ReplyWatcher(on_stall)
+    reply_watcher = ReplyWatcher(on_stall, call)
     recorder = CallerAudioRecorder(call.caller_number or call.caller_name) if cfg["RECORD_CALLER_AUDIO"] == "yes" else None
     pipeline = Pipeline(
         [
@@ -1338,7 +1361,7 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
         mode = cfg["DROPPED_CALL_TICKETS"]
         if dropped and (mode == "always" or (mode == "spoke" and caller_turns > 0)):
             # Detached, so it still finishes if this handler is cancelled as the WebSocket closes.
-            task = asyncio.create_task(log_dropped_call(call, call_id, cfg, list(context.get_messages())))
+            task = asyncio.create_task(log_dropped_call(call, call_id, cfg, _transcript(context)))
             _background.add(task)
             task.add_done_callback(_background.discard)
         bus.publish({"type": "call_end", "call_id": call_id})

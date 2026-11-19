@@ -227,6 +227,8 @@ def _transcript_lines(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
     """Caller/agent lines from the LLM context, skipping tool calls and internal notes."""
     lines = []
     for m in messages:
+        if not isinstance(m, dict):  # e.g. a Responses API reasoning record
+            continue
         role = m.get("role")
         if role not in ("user", "assistant"):
             continue
