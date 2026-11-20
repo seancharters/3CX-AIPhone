@@ -77,6 +77,34 @@ def _from_address(value: str) -> str:
     return value
 
 
+_DOMAIN = re.compile(r"(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
+
+
+def parse_customers(text: str) -> list[tuple[str, list[str]]]:
+    """'Linx Cargo Care = linxcc.com.au, linx.com.au' lines -> [("Linx Cargo Care", ["linxcc.com.au", ...])].
+    The domains are optional. Raises ValidationError naming the first bad line."""
+    customers = []
+    for n, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        name, _, domains = line.partition("=")
+        name = name.strip()
+        found = [d.strip().lower().lstrip("@") for d in domains.split(",") if d.strip()]
+        if not name:
+            raise ValidationError(f"Line {n}: put the company name before the =")
+        for d in found:
+            if not _DOMAIN.fullmatch(d):
+                raise ValidationError(f'Line {n}: "{d}" isn\'t an email domain, e.g. linxcc.com.au')
+        customers.append((name, found))
+    return customers
+
+
+def _customers(value: str) -> str:
+    parse_customers(value)
+    return value
+
+
 def _single_line(value: str) -> str:
     if any(c in value for c in "\r\n\0"):
         raise ValidationError("Must be a single line")
@@ -95,6 +123,7 @@ class Field:
     labels: tuple[str, ...] = ()  # display names for choices, same order
     multiline: bool = False  # shown as a text box; line breaks are turned into spaces
     long_text: bool = False  # large text box; line breaks kept. Stored empty while it equals the default
+    rows: int = 24  # height of a long_text box
     # Only shown in the admin UI when any of these settings has one of the listed values.
     show_if: tuple[tuple[str, tuple[str, ...]], ...] = ()
     validate: Callable[[str], str] = _single_line
@@ -188,6 +217,12 @@ FIELDS: tuple[Field, ...] = (
           "commas, e.g. staff first names, client company names, SharePoint, FortiGate. The company name is always included. "
           "Used by Azure AI Speech and ElevenLabs Scribe (whisper doesn't support this)",
           multiline=True),
+    Field("CUSTOMERS", "Customers", "Agent",
+          "The organisations you support, one per line, with their email domains after an = (optional), "
+          "e.g. Linx Cargo Care = linxcc.com.au. The agent uses these spellings when a caller names their "
+          "organisation or email domain, even if the speech-to-text mishears it (e.g. Links for Linx). "
+          "Names and domains are also added to the custom vocabulary",
+          long_text=True, rows=8, validate=_customers),
     Field("RECORD_CALLER_AUDIO", "Record caller audio (debugging)", "Agent",
           "Saves what the speech-to-text hears on each call (caller side only) so accuracy problems can be "
           "diagnosed. Keeps the last 10 calls on the server. Recordings contain callers' voices: switch off "

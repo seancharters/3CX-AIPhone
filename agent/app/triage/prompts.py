@@ -107,6 +107,23 @@ their behalf: the account holder must call.
 Never ask for their current password or an MFA app code."""
 
 
+def customer_rules(customers: list[tuple[str, list[str]]]) -> str:
+    """Appended to the system prompt when the Customers setting lists any."""
+    if not customers:
+        return ""
+    lines = "\n".join(f"- {name}" + (f" (email domain{'s' if len(d) > 1 else ''}: {', '.join(d)})" if d else "")
+                      for name, d in customers)
+    return (
+        "\n\n# Customers\n"
+        "These are the organisations you support. The caller's words reach you through speech-to-text, "
+        "which often mishears names (e.g. \"Links\" for \"Linx\"). When the organisation or email domain "
+        "a caller gives sounds like one below, it's that one: use exactly the spelling below for the "
+        "organisation and the email domain, in the ticket and when you read it back. Don't ask the caller to "
+        "spell a name or domain that's on this list. If they're not on the list, use what they say.\n"
+        + lines
+    )
+
+
 # Spoken when the call is answered, unless a custom greeting is set in the admin UI.
 _GREETING = (
     "Thanks for calling {company} IT support. You're speaking with an AI assistant, and this "

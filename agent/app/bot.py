@@ -62,7 +62,7 @@ from .asterisk import ASTERISK_FRAME_BYTES, ASTERISK_SAMPLE_RATE, AMIClient, Ast
 from . import handover, identity, psa, settings
 from .live import TranscriptTap, bus
 from .recorder import CallerAudioRecorder
-from .triage.prompts import RESET_RULES, greeting, instructions
+from .triage.prompts import RESET_RULES, customer_rules, greeting, instructions
 from .triage.tickets import Ticket, get_ticket_store
 
 
@@ -396,9 +396,27 @@ class AzureSTTWithVocabulary(AzureSTTService):
             await self.push_error(error_msg=f"Uncaught exception during initialization: {e}", exception=e)
 
 
-def vocabulary(cfg: dict[str, str]) -> list[str]:
-    words = [cfg["COMPANY_NAME"]] + [w.strip() for w in cfg["STT_VOCABULARY"].split(",")]
-    return list(dict.fromkeys(w for w in words if w and w != "the IT service desk"))
+# ElevenLabs' real-time Scribe accepts at most 50 keyterms of up to 20 characters each.
+# https://elevenlabs.io/docs/overview/capabilities/speech-to-text
+SCRIBE_MAX_KEYTERMS, SCRIBE_MAX_KEYTERM_CHARS = 50, 20
+
+
+def vocabulary(cfg: dict[str, str], scribe: bool = False) -> list[str]:
+    """Words to bias speech-to-text towards: the company name, customers and their domains, then the
+    custom vocabulary. With `scribe`, trimmed to what ElevenLabs accepts, in that order of priority."""
+    customers = settings.parse_customers(cfg["CUSTOMERS"])
+    words = ([cfg["COMPANY_NAME"]] + [name for name, _ in customers] + [d for _, ds in customers for d in ds]
+             + [w.strip() for w in cfg["STT_VOCABULARY"].split(",")])
+    words = list(dict.fromkeys(w for w in words if w and w != "the IT service desk"))
+    if scribe:
+        fits = [w for w in words if len(w) <= SCRIBE_MAX_KEYTERM_CHARS]
+        if len(fits) < len(words):
+            logger.info(f"Scribe vocabulary: skipped terms over {SCRIBE_MAX_KEYTERM_CHARS} characters: "
+                        + ", ".join(w for w in words if len(w) > SCRIBE_MAX_KEYTERM_CHARS))
+        if len(fits) > SCRIBE_MAX_KEYTERMS:
+            logger.info(f"Scribe vocabulary: using the first {SCRIBE_MAX_KEYTERMS} of {len(fits)} terms")
+        words = fits[:SCRIBE_MAX_KEYTERMS]
+    return words
 
 
 def _azure_host(endpoint: str) -> str:
@@ -413,7 +431,7 @@ def _stt(cfg: dict[str, str]) -> STTService:
             # ElevenLabs decides when a phrase has ended, so short answers like "yes" aren't left
             # waiting for our own speech detector.
             commit_strategy=CommitStrategy.VAD,
-            settings=ElevenLabsRealtimeSTTService.Settings(language="en", keyterms=vocabulary(cfg) or None),
+            settings=ElevenLabsRealtimeSTTService.Settings(language="en", keyterms=vocabulary(cfg, scribe=True) or None),
         )
     if cfg["STT_PROVIDER"] == "azure_whisper":
         endpoint = cfg["AZURE_WHISPER_ENDPOINT"] or cfg["AZURE_OPENAI_ENDPOINT"]
@@ -1275,7 +1293,7 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
                      "text": f"⚠️ Password resets are off for this call: missing {', '.join(missing_reset)}"})
     llm = _llm(cfg, instructions(cfg["COMPANY_NAME"], cfg["SYSTEM_PROMPT"]) + TOOL_RULES
                + (P1_RULES if cfg["TRANSFER_TARGET"] else "") + (RESET_RULES if resets_on else "")
-               + caller_ctx)
+               + customer_rules(settings.parse_customers(cfg["CUSTOMERS"])) + caller_ctx)
     stt = _stt(cfg)
     http = aiohttp.ClientSession()
     tts = _tts(cfg, call_id, http)

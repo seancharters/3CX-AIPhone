@@ -458,7 +458,7 @@ def _field(f: settings.Field, value: str, visible: bool = True) -> str:
         )
         control = f'<select id="{f.key}" name="{f.key}">{opts}</select>'
     elif f.long_text:
-        control = f'<textarea id="{f.key}" name="{f.key}" rows="24" class="prompt">{e(value)}</textarea>'
+        control = f'<textarea id="{f.key}" name="{f.key}" rows="{f.rows}" class="prompt">{e(value)}</textarea>'
     elif f.multiline:
         control = f'<textarea id="{f.key}" name="{f.key}" rows="3">{e(value)}</textarea>'
     elif f.secret:
