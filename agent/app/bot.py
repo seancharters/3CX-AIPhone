@@ -565,11 +565,14 @@ def _reset_tools(
 
     def verified_result() -> str:
         if s.sms_number:
-            return ("Verified. Confirm the caller wants their password reset now, and ask whether they'd like "
-                    "the new temporary password read out now, or sent by text message to the mobile on their "
-                    f"account ending in {', '.join(s.sms_number[-3:])}. Then call reset_password with their choice.")
-        return ("Verified. Confirm the caller wants their password reset now, then call reset_password with "
-                "delivery read_out. It can't be texted: there's no mobile number on their account.")
+            return ("Verified. They've already asked for a reset, so don't ask whether they want one. Ask only "
+                    "whether they'd like the new temporary password read out now, or sent by text message to the "
+                    f"mobile on their account ending in {', '.join(s.sms_number[-3:])}. Then call reset_password "
+                    "with their choice.")
+        return ("Verified. They've already asked for a reset, so don't ask whether they want one. Tell them "
+                "you're resetting it now and to have something ready to write the temporary password down, and "
+                "call reset_password with delivery read_out in that same reply. It can't be texted: there's no "
+                "mobile number on their account.")
 
     async def find_user_account(params: FunctionCallParams) -> None:
         nonlocal lookups
@@ -648,10 +651,17 @@ def _reset_tools(
                 f"Found the account for {name}. Check with the caller that this is them. To verify them, ask "
                 "for their employee ID number, then call verify_employee_id with it.")
         else:
+            # Sent straight away rather than leaving it to the model, which tends to say "one moment while
+            # I send that code" and then not call the tool.
+            if error := await send_code():
+                await params.result_callback(error)
+                return
             await params.result_callback(
-                f"Found the account for {name}. Check with the caller that this is them. To verify them, a "
-                f"six-digit code will be sent by SMS to the mobile number on their account, ending in "
-                f"{', '.join(number[-3:])}. Tell them, then call send_verification_code.")
+                f"Found the account for {name}, and a six-digit verification code has already been texted to "
+                f"the mobile number on their account, ending in {', '.join(number[-3:])}. In one short reply, "
+                "check this is them, tell them the code is on its way to that mobile, and ask them to read it "
+                "out when it arrives. Then call verify_sms_code with it. Only call send_verification_code if "
+                "they say it didn't arrive.")
 
     async def verify_employee_id(params: FunctionCallParams) -> None:
         if reason := blocked_reason():
@@ -685,6 +695,24 @@ def _reset_tools(
             f"That doesn't match the account. Ask them to say it again carefully. {left} attempt"
             f"{'s' if left > 1 else ''} left. Never hint at the correct number.")
 
+    async def send_code() -> str:
+        """Texts a new verification code to the account's mobile. Returns an error for the model, or ""."""
+        if s.sms_sends >= identity.MAX_SMS_SENDS:
+            return f"No more codes can be sent on this call. {refuse}"
+        code = s.new_code()
+        text = (f"Your IT support verification code is {code}. It expires in 10 minutes. If you didn't "
+                "call IT support, don't share it, and let your IT team know.")
+        try:
+            await identity.send_sms(cfg, s.sms_number, text)
+        except identity.IdentityError as err:
+            s.code = ""
+            logger.error(f"Verification SMS failed: {err}")
+            note(f"⚠️ SMS failed: {err}")
+            return f"The text message couldn't be sent. Apologise. {refuse}"
+        identity.audit("code_sent", to_ending=s.sms_number[-3:], **who())
+        note(f"📱 Verification code sent to …{s.sms_number[-3:]}")
+        return ""
+
     async def send_verification_code(params: FunctionCallParams) -> None:
         if reason := blocked_reason():
             await params.result_callback(reason)
@@ -696,25 +724,12 @@ def _reset_tools(
         if s.verified:
             await params.result_callback(verified_result())
             return
-        if s.sms_sends >= identity.MAX_SMS_SENDS:
-            await params.result_callback(f"No more codes can be sent on this call. {refuse}")
+        if error := await send_code():
+            await params.result_callback(error)
             return
-        code = s.new_code()
-        text = (f"Your IT support verification code is {code}. It expires in 10 minutes. If you didn't "
-                "call IT support, don't share it, and let your IT team know.")
-        try:
-            await identity.send_sms(cfg, s.sms_number, text)
-        except identity.IdentityError as err:
-            s.code = ""
-            logger.error(f"Verification SMS failed: {err}")
-            note(f"⚠️ SMS failed: {err}")
-            await params.result_callback(f"The text message couldn't be sent. Apologise. {refuse}")
-            return
-        identity.audit("code_sent", to_ending=s.sms_number[-3:], **who())
-        note(f"📱 Verification code sent to …{s.sms_number[-3:]}")
         await params.result_callback(
-            "Code sent. Ask the caller to read out the six-digit code when it arrives, then call "
-            "verify_sms_code with it. It's valid for 10 minutes.")
+            "A new code has been sent. Ask the caller to read out the six-digit code when it arrives, then call "
+            "verify_sms_code with it. It's valid for 10 minutes, and only the newest code works.")
 
     async def verify_sms_code(params: FunctionCallParams) -> None:
         if reason := blocked_reason():
@@ -873,11 +888,12 @@ def _reset_tools(
         ),
         FunctionSchema(
             name="send_verification_code",
-            description="Text a verification code to the mobile number on the caller's account. Takes no "
-                        "number: it only ever goes to the number on the account.",
+            description="Text a new verification code to the mobile number on the caller's account, if the "
+                        "first one (sent automatically by find_user_account) didn't arrive. Takes no number: it "
+                        "only ever goes to the number on the account.",
             properties={},
             required=[],
-            handler=with_filler(send_verification_code, speech, "Just a moment while I send that code."),
+            handler=with_filler(send_verification_code, speech, "Just a moment while I send a new code."),
         ),
         FunctionSchema(
             name="verify_sms_code",
@@ -1383,6 +1399,8 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
             logger.warning(f"Agent said it was {what} without calling the tool; prompting it")
             bus.publish({"type": "note", "call_id": call_id,
                          "text": f"⚠️ Agent said it was {what} without doing it; told it to do it now"})
+        instruction += (" Afterwards, don't repeat anything you've already told the caller: only tell them "
+                        "what's new.")
         context.add_message({"role": "user", "content": f"[System note, not from the caller: {instruction}]"})
         await worker.queue_frames([LLMRunFrame()])
 
