@@ -160,6 +160,7 @@ class CallInfo:
     # What the LLM said in its latest reply, and set once ReplyWatcher has seen all of that reply's
     # text (when it reaches the reply's tool calls), so a tool can check what was said alongside it.
     reply_text: str = ""
+    replies: int = 0  # LLM replies started so far, counted by ReplyWatcher
     reply_text_done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -299,6 +300,7 @@ class ReplyWatcher(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, LLMFullResponseStartFrame):
             self._text, self._called_tool = [], False
+            self._call.replies += 1
             self._call.reply_text = ""
             self._call.reply_text_done.clear()
         elif isinstance(frame, LLMTextFrame):
@@ -1374,11 +1376,17 @@ async def run_call(websocket: WebSocket, call: CallInfo, ami: AMIClient) -> None
         caller_turns += 1
 
     async def nudge(kind: str):
-        turns_before = caller_turns
+        turns_before, replies_before = caller_turns, call.replies
         await asyncio.sleep(1.5)  # the same reply may still be calling the tool
-        # If the caller spoke since, the model is already answering them (and may be calling the tool
-        # right now); a nudge on top of that makes it reply twice.
-        done = caller_turns != turns_before
+        if caller_turns != turns_before:
+            # The caller spoke, so the model may be about to answer them (and call the tool); a nudge on
+            # top of that makes it reply twice. But a breath or line noise can start a caller turn with
+            # nothing transcribed, and then no reply comes, so only stand down once a reply starts.
+            for _ in range(50):
+                if call.replies != replies_before:
+                    break
+                await asyncio.sleep(0.1)
+        done = call.replies != replies_before
         if kind == "ticket":
             done = done or call.ticket_started
         elif kind in ("transfer", "p1"):
